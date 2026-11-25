@@ -1,6 +1,10 @@
-import { type FigureId, PERSON_COLORS } from "./figures";
+import { BODY_PARTS, type FigureId, PERSON_COLORS } from "./figures";
 import { type PoseId, POSES } from "./poses";
-import { DEFAULT_CAMERA, type StageCamera, type StagePerson } from "./stage";
+import { PROP_COLORS, PROP_KINDS } from "./props";
+import { DEFAULT_CAMERA, type StageCamera, type StageContact, type StagePerson, type StageProp } from "./stage";
+
+/** 場面に置ける人物の数(参照画像の数と、描き分けの安定性から) */
+export const MAX_PEOPLE = PERSON_COLORS.length;
 
 /** scene.json の形の版。形を変えたら上げる */
 export const SCENE_SCHEMA_VERSION = 1;
@@ -40,6 +44,18 @@ export interface ScenePerson extends StagePerson {
   expression: Text;
 }
 
+/** 場面に置いた小物。寸法は実際の大きさ(cm) */
+export interface SceneProp extends StageProp {
+  id: string;
+  /** 見た目の説明(清書のプロンプトに使う) */
+  name: Text;
+}
+
+/** 触れる点(「Aの右手 → Bの肩」など) */
+export interface SceneContact extends StageContact {
+  id: string;
+}
+
 /** 清書を1回するごとに1つ増える。同じ絵を作り直せるよう、使ったものをすべて残す */
 export interface Take {
   id: string;
@@ -67,6 +83,8 @@ export interface Scene {
   updatedAt: string;
   frame: FrameId;
   people: ScenePerson[];
+  props: SceneProp[];
+  contacts: SceneContact[];
   camera: StageCamera;
   /** 背景(場所を使わないとき、背景は文章だけで決める) */
   background: Text;
@@ -90,10 +108,55 @@ export function newScene(title: string): Scene {
     updatedAt: now,
     frame: "cover",
     people: [],
+    props: [],
+    contacts: [],
     camera: { ...DEFAULT_CAMERA },
     background: emptyText(),
     takes: [],
     adopted: null,
+  };
+}
+
+/** 前の版(M1)で作った場面に、あとから足した項目を補う */
+export function normalizeScene(s: Scene): Scene {
+  return {
+    ...s,
+    props: s.props ?? [],
+    contacts: s.contacts ?? [],
+    camera: { ...DEFAULT_CAMERA, ...s.camera },
+    people: s.people.map((p) => ({ hands: { l: "auto", r: "auto" }, ik: {}, gaze: { kind: "manual" }, ...p })),
+  };
+}
+
+/** まだ使っていない色の番号 */
+export function freeColor(used: number[], count: number): number {
+  for (let i = 0; i < count; i++) if (!used.includes(i)) return i;
+  return used.length % count;
+}
+
+/** 人物を消したときに、番号で指している物(小物の持ち主・触れる点・視線)を付け直す */
+export function removePerson(s: Scene, index: number): Scene {
+  const shift = (i: number) => (i > index ? i - 1 : i);
+  return {
+    ...s,
+    people: s.people
+      .filter((_, i) => i !== index)
+      .map((p) => (p.gaze?.kind === "person" ? { ...p, gaze: p.gaze.index === index ? { kind: "manual" as const } : { kind: "person" as const, index: shift(p.gaze.index) } } : p)),
+    props: s.props.map((pr) => (pr.holder ? (pr.holder.person === index ? { ...pr, holder: null } : { ...pr, holder: { ...pr.holder, person: shift(pr.holder.person) } }) : pr)),
+    contacts: s.contacts
+      .filter((c) => c.to.person !== index && !(c.from.kind === "hand" && c.from.person === index))
+      .map((c) => ({ ...c, to: { ...c.to, person: shift(c.to.person) }, from: c.from.kind === "hand" ? { ...c.from, person: shift(c.from.person) } : c.from })),
+  };
+}
+
+/** 小物を消したときに、触れる点を付け直す */
+export function removeProp(s: Scene, index: number): Scene {
+  return {
+    ...s,
+    props: s.props.filter((_, i) => i !== index),
+    contacts: s.contacts
+      .filter((c) => !(c.from.kind === "prop" && c.from.prop === index))
+      .map((c) => (c.from.kind === "prop" && c.from.prop > index ? { ...c, from: { kind: "prop" as const, prop: c.from.prop - 1 } } : c)),
   };
 }
 
@@ -141,8 +204,8 @@ export function isMale(f: FigureId) {
   return f.startsWith("male");
 }
 
-/** Euros のキャラクターから、場面に置く人物を作る */
-export function personFrom(c: EurosCharacter, index: number): ScenePerson {
+/** Euros のキャラクターから、場面に置く人物を作る。color は色の番号 */
+export function personFrom(c: EurosCharacter, color: number): ScenePerson {
   const figure = guessFigure(c);
   return {
     characterId: c.id,
@@ -156,7 +219,10 @@ export function personFrom(c: EurosCharacter, index: number): ScenePerson {
     pose: "stand",
     headYaw: 0,
     headPitch: 0,
-    color: index,
+    color,
+    hands: { l: "auto", r: "auto" },
+    ik: {},
+    gaze: { kind: "manual" },
     action: emptyText(),
     expression: emptyText(),
   };
@@ -178,27 +244,56 @@ const clean = (s: string | undefined) => (s ?? "").trim().replace(/[\s.。]+$/, 
 
 const poseEn = (id: PoseId) => POSES.find((p) => p.id === id)?.en ?? "standing";
 
+const colorOf = (p: ScenePerson) => PERSON_COLORS[p.color % PERSON_COLORS.length].en;
+const sideEn = (side: "l" | "r") => (side === "l" ? "left" : "right");
+
+/** 人物を指す言葉(「the RED character」) */
+const who = (people: ScenePerson[], i: number) => (people[i] ? `the ${colorOf(people[i])} character` : "someone");
+
+const HAND_EN: Record<string, string> = { fist: "clenched in a fist", point: "pointing with the index finger", peace: "making a peace sign", open: "open" };
+
 /**
  * 清書のプロンプト。検証で効いた形(設計書 5.7):
  * Picture 1 = 下絵は位置・ポーズ・向き・カメラだけに使い、素体の体や色は描かない。Picture 2〜 = 人物のシート(色の順)
  */
 export function buildPrompt(scene: Scene, characters: Record<string, EurosCharacter>): string {
-  const people = scene.people;
+  const { people, props, contacts } = scene;
   const seat = people.some((p) => POSES.find((d) => d.id === p.pose)?.seat);
   const count = people.length === 1 ? "one character" : `${people.length} characters`;
+  const avoid = ["the figures", "their bare bodies", "the colors of the figures and objects", "the gray floor disc"];
   const lines = [
     `Redraw <Picture 1> as a finished, high-quality anime-style light novel ${scene.frame === "cover" ? "cover illustration" : "illustration"} with ${count}.`,
-    `<Picture 1> is only a rough 3D sketch of featureless posable figures: use it ONLY for each character's position, pose, body direction, head direction, arm and leg positions, their size, the camera angle and the framing. Keep all of these exactly. Do not draw the figures, their bare bodies, their colors or the gray floor disc${seat ? "; the brown box is the chair or seat they sit on" : ""}.`,
+    `<Picture 1> is only a rough 3D sketch of featureless posable figures and simple shapes: use it ONLY for each character's position, pose, body direction, head direction, arm and leg positions, the objects, the sizes and distances, the camera angle and the framing. Keep all of these exactly. Do not draw ${avoid.join(", ")}${seat ? "; the brown box is the chair or seat they sit on" : ""}.`,
   ];
   people.forEach((p, i) => {
     const c = characters[p.characterId];
-    const color = PERSON_COLORS[p.color % PERSON_COLORS.length].en;
     const parts = [
-      `- The ${color} figure is ${c?.profile?.name ? `${c.profile.name}, ` : ""}the character from the character sheet <Picture ${i + 2}>${c && lookOf(c) ? `: ${lookOf(c)}` : ""}.`,
+      `- The ${colorOf(p)} figure is ${c?.profile?.name ? `${c.profile.name}, ` : ""}the character from the character sheet <Picture ${i + 2}>${c && lookOf(c) ? `: ${lookOf(c)}` : ""}.`,
       `Pose: ${poseEn(p.pose)}${clean(p.action.en) ? `, ${clean(p.action.en)}` : ""}.`,
     ];
+    const hands = (["l", "r"] as const).filter((side) => HAND_EN[p.hands?.[side] ?? ""]).map((side) => `${sideEn(side)} hand ${HAND_EN[p.hands![side]]}`);
+    if (hands.length) parts.push(`Hands: ${hands.join(", ")}.`);
+    const gaze = p.gaze;
+    if (gaze?.kind === "camera") parts.push("Looking at the viewer.");
+    if (gaze?.kind === "person" && gaze.index !== i && people[gaze.index]) parts.push(`Looking at ${who(people, gaze.index)}.`);
     if (clean(p.expression.en)) parts.push(`Expression: ${clean(p.expression.en)}.`);
     lines.push(parts.join(" "));
+  });
+  props.forEach((pr) => {
+    const color = PROP_COLORS[pr.color % PROP_COLORS.length].en;
+    const what = clean(pr.name.en) || `a ${PROP_KINDS[pr.kind].en}`;
+    const k = pr.scale ?? { all: 1, length: 1, width: 1 };
+    const size = PROP_KINDS[pr.kind].long ? `about ${Math.round(pr.lengthCm * k.all * k.length)} cm long` : `about ${Math.round(pr.lengthCm * k.all)} cm`;
+    const where = pr.holder && people[pr.holder.person] ? `, held in ${who(people, pr.holder.person)}'s ${sideEn(pr.holder.side)} hand` : ", on the ground";
+    lines.push(`- The ${color} object is ${what} (${size})${where}. Draw it at exactly the size and position shown in <Picture 1>.`);
+  });
+  contacts.forEach((c) => {
+    const target = `${who(people, c.to.person)}'s ${BODY_PARTS[c.to.part].en}`;
+    const from =
+      c.from.kind === "hand"
+        ? `${who(people, c.from.person)}'s ${sideEn(c.from.side)} hand`
+        : `the tip of the ${PROP_COLORS[(props[c.from.prop]?.color ?? 0) % PROP_COLORS.length].en} object`;
+    lines.push(`- Contact: ${from} must clearly touch ${target}, exactly where they meet in <Picture 1>; no gap between them.`);
   });
   lines.push(
     people.length > 1
