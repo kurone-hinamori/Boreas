@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /><title>ポーズの確認</title>
+<style>body{margin:0;font:12px sans-serif}#grid{display:flex;flex-wrap:wrap;gap:4px}figure{margin:0;text-align:center}img{width:180px;border:1px solid #ccc}</style></head>
+<body>
+<!-- 開発用:すべてのポーズを並べて確かめる(npm run dev で http://localhost:1430/dev/poses.html) -->
+<canvas id="c" width="400" height="640" style="display:none"></canvas>
+<div id="grid"></div>
+<script type="module">
+import { Stage, DEFAULT_CAMERA } from "/src/lib/stage.ts";
+import { POSES } from "/src/lib/poses.ts";
+const q = new URLSearchParams(location.search);
+const stage = new Stage(document.getElementById("c"));
+stage.resize(400, 640);
+const yaw = Number(q.get("yaw") ?? 30);
+stage.setCamera({ ...DEFAULT_CAMERA, yaw });
+const figure = q.get("figure") ?? "female_standard";
+const base = { figure, heightCm: 150, x: 0, z: 0, rotation: 0, headYaw: 0, headPitch: 0, color: 0 };
+await stage.setPeople([{ ...base, pose: "stand" }]);
+for (const p of POSES) {
+  stage.updatePeople([{ ...base, pose: p.id }]);
+  const png = await stage.capture(360, 576);
+  const fig = document.createElement("figure");
+  fig.innerHTML = `<img src="${URL.createObjectURL(new Blob([png], { type: "image/png" }))}"><figcaption>${p.label}</figcaption>`;
+  document.getElementById("grid").append(fig);
+}
+window.done = true;
+</script>
+</body>
+</html>
