@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{json, Value};
@@ -12,6 +13,8 @@ const KINDS: [&str; 2] = ["places", "scenes"];
 /// Euros のキャラクターのフォルダーの中で、読んでよい画像の置き場所と拡張子
 const EUROS_FILE_DIRS: [&str; 2] = ["sheets", "refs"];
 const FILE_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+/// 場面のフォルダーの中の画像の置き場所。sketches は下絵、results は清書の候補
+const SCENE_FILE_DIRS: [&str; 2] = ["sketches", "results"];
 
 fn err<E: ToString>(e: E) -> String {
     e.to_string()
@@ -162,6 +165,118 @@ fn list_scenes(app: AppHandle) -> Result<Vec<Value>, String> {
     Ok(list_entries_in(&library_dir(&app)?, "scenes", "scene.json"))
 }
 
+fn scene_dir(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
+    if !valid_id(id) {
+        return Err("invalid id".into());
+    }
+    Ok(library_dir(app)?.join("scenes").join(id))
+}
+
+#[tauri::command]
+fn load_scene(app: AppHandle, id: String) -> Result<Value, String> {
+    let text = fs::read_to_string(scene_dir(&app, &id)?.join("scene.json")).map_err(err)?;
+    serde_json::from_str(&text).map_err(err)
+}
+
+#[tauri::command]
+fn save_scene(app: AppHandle, scene: Value) -> Result<(), String> {
+    let id = scene.get("id").and_then(Value::as_str).ok_or("scene id missing")?;
+    let dir = scene_dir(&app, id)?;
+    fs::create_dir_all(&dir).map_err(err)?;
+    write_json(&dir.join("scene.json"), &scene)
+}
+
+/// 消した場面は、すぐには消さずライブラリの .trash に移す
+#[tauri::command]
+fn delete_scene(app: AppHandle, id: String) -> Result<(), String> {
+    scene_dir(&app, &id)?;
+    move_to_trash(&library_dir(&app)?, "scenes", &id)
+}
+
+fn move_to_trash(library: &Path, kind: &str, id: &str) -> Result<(), String> {
+    let dir = library.join(kind).join(id);
+    if !dir.exists() {
+        return Ok(());
+    }
+    let trash = library.join(".trash");
+    fs::create_dir_all(&trash).map_err(err)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(err)?.as_secs();
+    // 場所と見分けられるよう、名前の頭に scene- や place- を付ける
+    let prefix = if kind == "scenes" { "scene-" } else { "place-" };
+    fs::rename(&dir, trash.join(format!("{prefix}{id}-{stamp}"))).map_err(err)
+}
+
+/// "sketches/xxx.png" のような、場面のフォルダーの中の画像だけを許す
+fn scene_file_rel(file: &str) -> Result<(&str, &str), String> {
+    let mut parts = file.split('/');
+    let (Some(dir), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("invalid file path".into());
+    };
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return Err("invalid file name".into());
+    };
+    if !SCENE_FILE_DIRS.contains(&dir) || !valid_id(stem) || !FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+        return Err("invalid file path".into());
+    }
+    Ok((dir, name))
+}
+
+fn scene_file_path(app: &AppHandle, id: &str, file: &str) -> Result<PathBuf, String> {
+    let (dir, name) = scene_file_rel(file)?;
+    Ok(scene_dir(app, id)?.join(dir).join(name))
+}
+
+/// 画像の中身をそのまま受け取る(id と file はヘッダーで渡す)
+#[tauri::command]
+fn save_scene_file(app: AppHandle, request: tauri::ipc::Request) -> Result<(), String> {
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| format!("missing {name}"))
+    };
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("file bytes expected".into());
+    };
+    let path = scene_file_path(&app, &header("id")?, &header("file")?)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(err)?;
+    }
+    fs::write(path, bytes).map_err(err)
+}
+
+#[tauri::command]
+fn load_scene_file(app: AppHandle, id: String, file: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = fs::read(scene_file_path(&app, &id, &file)?).map_err(err)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+fn delete_scene_file(app: AppHandle, id: String, file: String) -> Result<(), String> {
+    let path = scene_file_path(&app, &id, &file)?;
+    if path.exists() {
+        fs::remove_file(path).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// 清書の画像を、選んだ場所に書き出す
+#[tauri::command]
+fn export_scene_file(app: AppHandle, id: String, file: String, path: String) -> Result<(), String> {
+    fs::copy(scene_file_path(&app, &id, &file)?, path).map_err(err)?;
+    Ok(())
+}
+
+/// 場面のフォルダーをエクスプローラーで開く
+#[tauri::command]
+fn open_scene_folder(app: AppHandle, id: String) -> Result<(), String> {
+    let dir = scene_dir(&app, &id)?;
+    fs::create_dir_all(&dir).map_err(err)?;
+    app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(err)
+}
+
 #[tauri::command]
 fn list_places(app: AppHandle) -> Result<Vec<Value>, String> {
     Ok(list_entries_in(&library_dir(&app)?, "places", "place.json"))
@@ -201,6 +316,17 @@ fn list_characters_in(euros: &Path) -> Vec<Value> {
 #[tauri::command]
 fn list_euros_characters(app: AppHandle) -> Result<Vec<Value>, String> {
     Ok(list_characters_in(&euros_library(&app)?))
+}
+
+/// Euros のキャラクターを丸ごと読む(書き換えない)
+#[tauri::command]
+fn load_euros_character(app: AppHandle, id: String) -> Result<Value, String> {
+    if !valid_id(&id) {
+        return Err("invalid id".into());
+    }
+    let path = euros_library(&app)?.join("characters").join(&id).join("character.json");
+    let text = fs::read_to_string(path).map_err(|_| "Euros のキャラクターが見つかりません".to_string())?;
+    serde_json::from_str(&text).map_err(err)
 }
 
 /// "sheets/xxx.png" のような、キャラクターのフォルダーの中の画像だけを許す
@@ -248,8 +374,17 @@ pub fn run() {
             folders,
             open_folder,
             list_scenes,
+            load_scene,
+            save_scene,
+            delete_scene,
+            save_scene_file,
+            load_scene_file,
+            delete_scene_file,
+            export_scene_file,
+            open_scene_folder,
             list_places,
             list_euros_characters,
+            load_euros_character,
             load_euros_file
         ])
         .run(tauri::generate_context!())
@@ -295,6 +430,28 @@ mod tests {
         assert!(euros_file_path(euros, "..", "sheets/r1.png").is_err());
         assert!(euros_file_path(euros, "c1", "character.json").is_err());
         assert!(euros_file_path(euros, "c1", "sheets/r1.exe").is_err());
+    }
+
+    #[test]
+    fn scene_files_stay_inside_the_scene() {
+        assert_eq!(scene_file_rel("sketches/t1.png").unwrap(), ("sketches", "t1.png"));
+        assert!(scene_file_rel("results/t1.png").is_ok());
+        assert!(scene_file_rel("../x.png").is_err());
+        assert!(scene_file_rel("results/../../x.png").is_err());
+        assert!(scene_file_rel("scene.json").is_err());
+        assert!(scene_file_rel("designs/a.png").is_err());
+    }
+
+    #[test]
+    fn trashed_scenes_leave_the_list() {
+        let lib = temp("trash");
+        let dir = lib.join("scenes/s1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("scene.json"), json!({ "id": "s1" }).to_string()).unwrap();
+        assert_eq!(list_entries_in(&lib, "scenes", "scene.json").len(), 1);
+        move_to_trash(&lib, "scenes", "s1").unwrap();
+        assert!(list_entries_in(&lib, "scenes", "scene.json").is_empty());
+        assert!(fs::read_dir(lib.join(".trash")).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("scene-s1-")));
     }
 
     #[test]
