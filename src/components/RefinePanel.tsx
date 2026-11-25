@@ -4,7 +4,7 @@ import type { Settings } from "../types";
 import { detectModels, progressText, refine, uploadImage } from "../lib/comfy";
 import { unloadModel, translateFields } from "../lib/ollama";
 import { useLeaveGuard } from "../lib/leaveGuard";
-import { buildPrompt, currentSheet, type EurosCharacter, FRAMES, newId, type Scene, sketchSize, type Take } from "../lib/scene";
+import { buildPrompt, currentSheet, type EurosCharacter, FRAMES, newId, type Scene, sketchSize, type Take, type Text } from "../lib/scene";
 import { deleteSceneFile, eurosFileBytes, exportSceneFile, saveSceneFile, sceneFileUrl } from "../lib/storage";
 import type { ViewportHandle } from "./Viewport";
 
@@ -50,22 +50,36 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
   useLeaveGuard(status.running ? "清書の途中です。画面を離れると中断します。" : null);
   useEffect(() => () => abort.current?.abort(), []);
 
-  const person = scene.people[0];
-  const character = person ? characters[person.characterId] : undefined;
-  const sheet = character ? currentSheet(character) : null;
+  // Picture 2 以降に渡すシート(人物の順)
+  const sheets = scene.people.map((p) => {
+    const c = characters[p.characterId];
+    const sh = c ? currentSheet(c) : null;
+    return c && sh ? { character: c, ...sh } : null;
+  });
+  const noSheet = scene.people.filter((_, i) => !sheets[i]).map((p) => p.name);
   const prompt = buildPrompt(scene, characters);
-  const missingEn = !!person && ((!!person.action.ja.trim() && !person.action.en.trim()) || (!!person.expression.ja.trim() && !person.expression.en.trim()) || (!!scene.background.ja.trim() && !scene.background.en.trim()));
+  // 日本語だけで、英語になっていない項目
+  const texts: [string, Text][] = [
+    ...scene.people.flatMap((p, i): [string, Text][] => [
+      [`p${i}_action`, p.action],
+      [`p${i}_expression`, p.expression],
+    ]),
+    ...scene.props.map((pr, k): [string, Text] => [`prop${k}`, pr.name]),
+    ["background", scene.background],
+  ];
+  const missingEn = texts.some(([, t]) => t.ja.trim() && !t.en.trim());
 
   const translate = async () => {
-    if (!person) return;
     setTranslating(true);
     setStatus({ running: false, text: "" });
     try {
-      const en = await translateFields(settings, { action: person.action.ja, expression: person.expression.ja, background: scene.background.ja });
+      const en = await translateFields(settings, Object.fromEntries(texts.map(([k, t]) => [k, t.ja])));
+      const pick = (k: string, t: Text): Text => ({ ...t, en: t.ja.trim() ? (en[k] ?? t.en) : "" });
       change((s) => ({
         ...s,
-        background: { ...s.background, en: en.background },
-        people: s.people.map((p, i) => (i === 0 ? { ...p, action: { ...p.action, en: en.action }, expression: { ...p.expression, en: en.expression } } : p)),
+        background: pick("background", s.background),
+        people: s.people.map((p, i) => ({ ...p, action: pick(`p${i}_action`, p.action), expression: pick(`p${i}_expression`, p.expression) })),
+        props: s.props.map((pr, k) => ({ ...pr, name: pick(`prop${k}`, pr.name) })),
       }));
     } catch (e) {
       setStatus({ running: false, text: "", error: `英語にできませんでした:${message(e)}` });
@@ -75,7 +89,7 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
   };
 
   const run = async () => {
-    if (!person || !character || !sheet || !viewport.current) return;
+    if (!scene.people.length || noSheet.length || !viewport.current) return;
     abort.current?.abort();
     const ctrl = new AbortController();
     abort.current = ctrl;
@@ -96,7 +110,7 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
       await unloadModel(settings);
       say("下絵とシートを ComfyUI に送っています");
       const images = [await uploadImage(settings, `sketch_${scene.id}_${sketchId}.png`, sketchPng)];
-      images.push(await uploadImage(settings, `sheet_${character.id}_${sheet.revisionId}.png`, await eurosFileBytes(character.id, sheet.image)));
+      for (const sh of sheets) images.push(await uploadImage(settings, `sheet_${sh!.character.id}_${sh!.revisionId}.png`, await eurosFileBytes(sh!.character.id, sh!.image)));
 
       const { width, height } = FRAMES[scene.frame];
       for (let i = 0; i < count; i++) {
@@ -110,7 +124,7 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
           result: null,
           seed,
           prompt,
-          sheets: [{ characterId: character.id, revisionId: sheet.revisionId }],
+          sheets: sheets.map((sh) => ({ characterId: sh!.character.id, revisionId: sh!.revisionId })),
         };
         const label = count > 1 ? `${i + 1}/${count}枚目:` : "";
         try {
@@ -156,28 +170,36 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
             <span>背景(日本語)</span>
             <textarea rows={2} value={scene.background.ja} placeholder="例:夕暮れの学校の屋上。金網のフェンス" onChange={(e) => change((s) => ({ ...s, background: { ...s.background, ja: e.target.value } }))} />
           </label>
-          {person && (
-            <div className="en-fields">
-              <div className="row" style={{ marginBottom: 6 }}>
-                <button className="small" disabled={translating || status.running} onClick={() => void translate()}>
-                  {translating ? "英語にしています…" : "英語にする(Ollama)"}
-                </button>
-                {missingEn && <small className="error">英語になっていない項目があります</small>}
-              </div>
-              <label className="field">
-                <span>動作(英語)</span>
-                <input className="en" value={person.action.en} onChange={(e) => change((s) => ({ ...s, people: s.people.map((p, i) => (i === 0 ? { ...p, action: { ...p.action, en: e.target.value } } : p)) }))} />
-              </label>
-              <label className="field">
-                <span>表情(英語)</span>
-                <input className="en" value={person.expression.en} onChange={(e) => change((s) => ({ ...s, people: s.people.map((p, i) => (i === 0 ? { ...p, expression: { ...p.expression, en: e.target.value } } : p)) }))} />
-              </label>
-              <label className="field">
-                <span>背景(英語)</span>
-                <input className="en" value={scene.background.en} onChange={(e) => change((s) => ({ ...s, background: { ...s.background, en: e.target.value } }))} />
-              </label>
+          <div className="en-fields">
+            <div className="row" style={{ marginBottom: 6 }}>
+              <button className="small" disabled={translating || status.running} onClick={() => void translate()}>
+                {translating ? "英語にしています…" : "英語にする(Ollama)"}
+              </button>
+              {missingEn && <small className="error">英語になっていない項目があります</small>}
             </div>
-          )}
+            {scene.people.map((p, i) => (
+              <div key={i} className="two">
+                <label className="field">
+                  <span>{p.name}の動作(英語)</span>
+                  <input className="en" value={p.action.en} onChange={(e) => change((s) => ({ ...s, people: s.people.map((x, k) => (k === i ? { ...x, action: { ...x.action, en: e.target.value } } : x)) }))} />
+                </label>
+                <label className="field">
+                  <span>{p.name}の表情(英語)</span>
+                  <input className="en" value={p.expression.en} onChange={(e) => change((s) => ({ ...s, people: s.people.map((x, k) => (k === i ? { ...x, expression: { ...x.expression, en: e.target.value } } : x)) }))} />
+                </label>
+              </div>
+            ))}
+            {scene.props.map((pr, k) => (
+              <label key={pr.id} className="field">
+                <span>{pr.name.ja || "小物"}(英語)</span>
+                <input className="en" value={pr.name.en} onChange={(e) => change((s) => ({ ...s, props: s.props.map((x, i) => (i === k ? { ...x, name: { ...x.name, en: e.target.value } } : x)) }))} />
+              </label>
+            ))}
+            <label className="field">
+              <span>背景(英語)</span>
+              <input className="en" value={scene.background.en} onChange={(e) => change((s) => ({ ...s, background: { ...s.background, en: e.target.value } }))} />
+            </label>
+          </div>
           <details className="prompt">
             <summary>清書に使うプロンプト</summary>
             <pre>{prompt}</pre>
@@ -198,13 +220,13 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
             {status.running ? (
               <button onClick={() => abort.current?.abort()}>中断</button>
             ) : (
-              <button className="primary" disabled={!person || !sheet} onClick={() => void run()}>
+              <button className="primary" disabled={!scene.people.length || noSheet.length > 0} onClick={() => void run()}>
                 清書する
               </button>
             )}
           </div>
-          {!person && <p className="muted small-text">人物を選ぶと清書できます。</p>}
-          {person && !sheet && <p className="error small-text">このキャラクターには Euros のシートがありません。</p>}
+          {!scene.people.length && <p className="muted small-text">人物を置くと清書できます。</p>}
+          {noSheet.length > 0 && <p className="error small-text">{noSheet.join("・")}には Euros のシートがありません。</p>}
           <p className="muted small-text">1枚に6分ほどかかります。ComfyUI に MiniMax-H3-Image のモデルが必要です。</p>
           {status.running && <p className="status">{status.text}</p>}
           {!status.running && status.text && <p className="muted">{status.text}</p>}

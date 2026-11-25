@@ -16,9 +16,8 @@ const yaw = Number(q.get("yaw") ?? 30);
 stage.setCamera({ ...DEFAULT_CAMERA, yaw });
 const figure = q.get("figure") ?? "female_standard";
 const base = { figure, heightCm: 150, x: 0, z: 0, rotation: 0, headYaw: 0, headPitch: 0, color: 0 };
-await stage.setPeople([{ ...base, pose: "stand" }]);
 for (const p of POSES) {
-  stage.updatePeople([{ ...base, pose: p.id }]);
+  await stage.setState({ people: [{ ...base, pose: p.id }], props: [], contacts: [] }, null);
   const png = await stage.capture(360, 576);
   const fig = document.createElement("figure");
   fig.innerHTML = `<img src="${URL.createObjectURL(new Blob([png], { type: "image/png" }))}"><figcaption>${p.label}</figcaption>`;

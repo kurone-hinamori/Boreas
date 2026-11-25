@@ -1,8 +1,14 @@
 import * as THREE from "three";
-import { Figure, type FigureId, PERSON_COLORS } from "./figures";
+import { BODY_PARTS, type BodyPart, Figure, type FigureId, type HandShape, LIMBS, type LimbId, PERSON_COLORS } from "./figures";
 import { type PoseId, POSES } from "./poses";
+import { dirFromAngles, PROP_COLORS, PROP_KINDS, type PropShape, propMesh } from "./props";
 
 /** 場面の 3D 表示。下絵(清書に渡す画像)もここで撮る */
+
+/** 人物から見た位置(m)。+Z が前、+X が人物の左、+Y が上 */
+export type Vec3 = [number, number, number];
+
+export type Gaze = { kind: "manual" } | { kind: "camera" } | { kind: "person"; index: number };
 
 export interface StagePerson {
   figure: FigureId;
@@ -13,11 +19,45 @@ export interface StagePerson {
   z: number;
   rotation: number;
   pose: PoseId;
-  /** 首の向き(度)。yaw は左右(+ で人物の左)、pitch は上下(+ で下を向く) */
+  /** 首の向き(度)。yaw は左右(+ で人物の左)、pitch は上下(+ で下を向く)。視線が manual のときに使う */
   headYaw: number;
   headPitch: number;
   /** 色の番号(PERSON_COLORS) */
   color: number;
+  /** 手の形 */
+  hands?: { l: HandShape; r: HandShape };
+  /** 関節をつかんで動かした手足の先の位置(人物から見た位置)。ないときはポーズのまま */
+  ik?: Partial<Record<LimbId, Vec3>>;
+  /** 視線 */
+  gaze?: Gaze;
+}
+
+export interface StageProp extends PropShape {
+  /** 色の番号(PROP_COLORS) */
+  color: number;
+  /** 持つ人物(people の番号)と手。null なら床に置く */
+  holder: { person: number; side: "l" | "r" } | null;
+  /** 床に置くときの位置(m) */
+  x: number;
+  z: number;
+  /** 向き(度)。持つときは人物から見た向き、置くときは場面の向き */
+  yaw: number;
+  pitch: number;
+  /** 誇張(場面だけで大きさを変える倍率。M3 で使う) */
+  scale?: { all: number; length: number; width: number };
+}
+
+export type ContactFrom = { kind: "hand"; person: number; side: "l" | "r" } | { kind: "prop"; prop: number };
+
+export interface StageContact {
+  from: ContactFrom;
+  to: { person: number; part: BodyPart };
+}
+
+export interface StageState {
+  people: StagePerson[];
+  props: StageProp[];
+  contacts: StageContact[];
 }
 
 export interface StageCamera {
@@ -31,20 +71,34 @@ export interface StageCamera {
   targetY: number;
   /** 縦の画角(度) */
   fov: number;
+  /** 注視点の床の位置(m) */
+  targetX?: number;
+  targetZ?: number;
 }
 
-export const DEFAULT_CAMERA: StageCamera = { yaw: 0, pitch: 4, distance: 4.2, targetY: 0.85, fov: 35 };
+export const DEFAULT_CAMERA: StageCamera = { yaw: 0, pitch: 4, distance: 4.2, targetY: 0.85, fov: 35, targetX: 0, targetZ: 0 };
+
+/** クリックした物 */
+export type Pick = { kind: "handle"; person: number; limb: LimbId } | { kind: "person"; person: number } | null;
 
 const BG = 0xffffff;
+/** 触れる点の印の色(編集の画面にだけ出す) */
+export const MARK_COLOR = 0xd02020;
 
 export class Stage {
   readonly renderer: THREE.WebGLRenderer;
   readonly scene = new THREE.Scene();
   readonly camera = new THREE.PerspectiveCamera(35, 1, 0.05, 100);
   private figures: Figure[] = [];
-  private seats: THREE.Mesh[] = [];
+  private figureKey = "";
+  /** 状態が変わるたびに作り直す物(椅子・小物・印・つかむ点) */
+  private extras = new THREE.Group();
+  private handles = new THREE.Group();
   private loading = 0;
   private aspect = 1;
+  private state: StageState = { people: [], props: [], contacts: [] };
+  private selected: number | null = null;
+  private raycaster = new THREE.Raycaster();
 
   constructor(canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
@@ -55,9 +109,9 @@ export class Stage {
     sun.position.set(-1.5, 3, 2.5);
     this.scene.add(sun);
     // 床の目安(清書では描かない。立ち位置と大きさの手がかり)
-    const ground = new THREE.Mesh(new THREE.CircleGeometry(2.4, 64), new THREE.MeshStandardMaterial({ color: 0xeeeeee }));
+    const ground = new THREE.Mesh(new THREE.CircleGeometry(3, 64), new THREE.MeshStandardMaterial({ color: 0xeeeeee }));
     ground.rotation.x = -Math.PI / 2;
-    this.scene.add(ground);
+    this.scene.add(ground, this.extras, this.handles);
   }
 
   /** 表示する大きさ(px)と、枠の縦横比 */
@@ -66,52 +120,168 @@ export class Stage {
     this.aspect = width / height;
   }
 
-  /** 人物を並べ直す。素体の読み込みが終わってから表示を変える */
-  async setPeople(people: StagePerson[]) {
-    const ticket = ++this.loading;
-    const loaded = await Promise.all(people.map((p) => Figure.load(p.figure)));
-    if (ticket !== this.loading) return loaded.forEach((f) => f.dispose());
-    this.figures.forEach((f) => f.dispose());
-    this.seats.forEach((s) => s.removeFromParent());
-    this.seats = [];
-    this.figures = loaded;
-    loaded.forEach((f, i) => {
-      this.scene.add(f.root);
-      this.pose(f, people[i]);
+  /** 場面の状態を表示に反映する。素体が変わったときだけ読み直す */
+  async setState(state: StageState, selected: number | null) {
+    this.state = state;
+    this.selected = selected;
+    const key = state.people.map((p) => p.figure).join(",");
+    if (key !== this.figureKey) {
+      const ticket = ++this.loading;
+      const loaded = await Promise.all(state.people.map((p) => Figure.load(p.figure)));
+      if (ticket !== this.loading) return loaded.forEach((f) => f.dispose());
+      this.figures.forEach((f) => f.dispose());
+      this.figures = loaded;
+      this.figureKey = key;
+      loaded.forEach((f) => this.scene.add(f.root));
+    }
+    this.apply();
+  }
+
+  /** ポーズ → つかんだ手足 → 触れる点 → 視線 → 小物 の順に決める */
+  private apply() {
+    const { people, props, contacts } = this.state;
+    if (this.figures.length !== people.length) return;
+    this.clear(this.extras);
+    this.clear(this.handles);
+
+    people.forEach((p, i) => {
+      const f = this.figures[i];
+      f.setColor(PERSON_COLORS[p.color % PERSON_COLORS.length].hex);
+      f.setHeight(p.heightCm / 100);
+      f.root.position.set(p.x, 0, p.z);
+      f.root.rotation.y = THREE.MathUtils.degToRad(p.rotation);
+      f.pose(p.pose);
+      // 小物を持つ手は、形を決めていなければ握る
+      const holds = (side: "l" | "r") => props.some((pr) => pr.holder?.person === i && pr.holder.side === side);
+      for (const side of ["l", "r"] as const) {
+        const shape = p.hands?.[side] ?? "auto";
+        f.handShape(side, shape === "auto" && holds(side) ? "fist" : shape);
+      }
+      if (POSES.find((d) => d.id === p.pose)?.seat) {
+        // 座面の高さは、身長の 0.25 倍ほど(膝の高さ)
+        const h = (p.heightCm / 100) * 0.25;
+        const seat = new THREE.Mesh(new THREE.BoxGeometry(0.42, h, 0.42), new THREE.MeshStandardMaterial({ color: 0x9a7a5a }));
+        seat.position.set(0, h / 2, -0.02);
+        seat.applyMatrix4(f.root.matrix);
+        this.extras.add(seat);
+      }
     });
+
+    // 関節をつかんで動かした手足
+    people.forEach((p, i) => {
+      for (const [limb, pos] of Object.entries(p.ik ?? {}) as [LimbId, Vec3][]) this.figures[i].reach(limb, this.figures[i].toWorld(new THREE.Vector3(...pos)));
+    });
+
+    // 触れる点:手を相手の部位に寄せる。小物は先を相手に向け、手の位置を合わせる
+    for (const c of contacts) {
+      const target = this.contactPoint(c);
+      if (!target) continue;
+      if (c.from.kind === "hand") {
+        this.figures[c.from.person]?.reach(`hand_${c.from.side}`, target);
+      } else {
+        const prop = props[c.from.prop];
+        const holder = prop?.holder && this.figures[prop.holder.person];
+        if (prop?.holder && holder) {
+          const shoulder = holder.bonePosition(`upperarm_${prop.holder.side}`)!;
+          const dir = target.clone().sub(shoulder).normalize();
+          const tip = this.propLength(prop) * (1 - prop.grip);
+          holder.reach(`hand_${prop.holder.side}`, target.clone().sub(dir.multiplyScalar(tip)));
+        }
+      }
+      const mark = new THREE.Mesh(new THREE.SphereGeometry(0.022, 16, 12), new THREE.MeshBasicMaterial({ color: MARK_COLOR }));
+      mark.position.copy(target);
+      // 印は編集の画面にだけ出す(下絵に写すと、清書で黒い点が描かれることがあった)
+      this.handles.add(mark);
+    }
+
+    // 視線
+    people.forEach((p, i) => {
+      const f = this.figures[i];
+      const gaze = p.gaze ?? { kind: "manual" };
+      if (gaze.kind === "manual") return f.turnHead(p.headYaw, p.headPitch);
+      const target = gaze.kind === "camera" ? this.camera.position.clone() : this.figures[gaze.index]?.bonePosition("head");
+      if (!target || (gaze.kind === "person" && gaze.index === i)) return f.turnHead(p.headYaw, p.headPitch);
+      const a = f.gazeAngles(target);
+      f.turnHead(a.yaw, a.pitch);
+    });
+
+    // 小物
+    props.forEach((prop, k) => {
+      const mesh = propMesh(this.scaled(prop), PROP_COLORS[prop.color % PROP_COLORS.length].hex);
+      const holder = prop.holder && this.figures[prop.holder.person];
+      if (prop.holder && holder) {
+        // 握る位置は、手首より少し先(中指の付け根)
+        const hand = holder.bonePosition(`middle_01_${prop.holder.side}`)!;
+        // 触れる点があれば先を相手に向ける。なければ指定の向き
+        const contact = contacts.find((c) => c.from.kind === "prop" && c.from.prop === k);
+        const target = contact && this.contactPoint(contact);
+        const dir = target ? target.clone().sub(hand).normalize() : holder.dirToWorld(dirFromAngles(prop.yaw, prop.pitch));
+        mesh.position.copy(hand);
+        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+      } else if (PROP_KINDS[prop.kind].long) {
+        // 床に寝かせる(太さの半分だけ浮かせる)
+        mesh.position.set(prop.x, this.scaled(prop).widthCm / 200, prop.z);
+        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(...dirFromAngles(prop.yaw, prop.pitch)));
+      } else {
+        mesh.position.set(prop.x, 0, prop.z);
+        mesh.rotation.y = THREE.MathUtils.degToRad(prop.yaw);
+      }
+      this.extras.add(mesh);
+    });
+
+    // 選んだ人物の、つかめる手足の先
+    if (this.selected !== null && this.figures[this.selected]) {
+      const f = this.figures[this.selected];
+      for (const limb of Object.keys(LIMBS) as LimbId[]) {
+        const h = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 12), new THREE.MeshBasicMaterial({ color: 0x111111, depthTest: false, transparent: true, opacity: 0.85 }));
+        h.renderOrder = 999;
+        h.position.copy(f.bonePosition(LIMBS[limb].bones[2])!);
+        h.userData = { person: this.selected, limb };
+        this.handles.add(h);
+      }
+    }
   }
 
-  /** 素体を読み直さずに、ポーズと立ち位置だけを変える */
-  updatePeople(people: StagePerson[]) {
-    this.seats.forEach((s) => s.removeFromParent());
-    this.seats = [];
-    this.figures.forEach((f, i) => people[i] && this.pose(f, people[i]));
+  /** 誇張の倍率を掛けた寸法 */
+  private scaled(p: StageProp): StageProp {
+    const s = p.scale ?? { all: 1, length: 1, width: 1 };
+    return { ...p, lengthCm: p.lengthCm * s.all * s.length, widthCm: p.widthCm * s.all * s.width, heightCm: p.heightCm * s.all };
   }
 
-  private pose(f: Figure, p: StagePerson) {
-    f.setColor(PERSON_COLORS[p.color % PERSON_COLORS.length].hex);
-    f.setHeight(p.heightCm / 100);
-    f.root.position.set(p.x, 0, p.z);
-    f.root.rotation.y = THREE.MathUtils.degToRad(p.rotation);
-    f.pose(p.pose);
-    f.turn("neck_01", [0, 1, 0], p.headYaw * 0.4);
-    f.turn("head", [0, 1, 0], p.headYaw * 0.6);
-    f.turn("neck_01", [1, 0, 0], p.headPitch * 0.4);
-    f.turn("head", [1, 0, 0], p.headPitch * 0.6);
-    if (POSES.find((d) => d.id === p.pose)?.seat) {
-      // 座面の高さは、身長の 0.25 倍ほど(膝の高さ)
-      const h = (p.heightCm / 100) * 0.25;
-      const seat = new THREE.Mesh(new THREE.BoxGeometry(0.42, h, 0.42), new THREE.MeshStandardMaterial({ color: 0x9a7a5a }));
-      seat.position.set(0, h / 2, -0.02);
-      f.root.add(seat);
-      this.seats.push(seat);
+  private propLength(p: StageProp) {
+    return this.scaled(p).lengthCm / 100;
+  }
+
+  /** 触れる点の位置。体の中の骨から、触れる側に少し出す(体の表面のあたり) */
+  private contactPoint(c: StageContact): THREE.Vector3 | null {
+    const f = this.figures[c.to.person];
+    if (!f) return null;
+    const p = f.bonePosition(BODY_PARTS[c.to.part].bone);
+    if (!p) return null;
+    const fromFigure = c.from.kind === "hand" ? this.figures[c.from.person] : this.state.props[c.from.prop]?.holder ? this.figures[this.state.props[c.from.prop].holder!.person] : null;
+    const toward = fromFigure ? fromFigure.root.position.clone().setY(p.y).sub(p) : new THREE.Vector3();
+    const depth = c.to.part === "chest" || c.to.part === "waist" ? 0.1 : c.to.part === "head" ? 0.09 : 0.04;
+    if (toward.lengthSq() > 1e-6) p.add(toward.normalize().multiplyScalar(depth));
+    return p;
+  }
+
+  private clear(g: THREE.Group) {
+    for (const o of [...g.children]) {
+      o.removeFromParent();
+      o.traverse((x) => {
+        const m = x as THREE.Mesh;
+        if (m.isMesh) {
+          m.geometry.dispose();
+          (m.material as THREE.Material).dispose();
+        }
+      });
     }
   }
 
   setCamera(c: StageCamera) {
     const yaw = THREE.MathUtils.degToRad(c.yaw);
     const pitch = THREE.MathUtils.degToRad(c.pitch);
-    const target = new THREE.Vector3(0, c.targetY, 0);
+    const target = new THREE.Vector3(c.targetX ?? 0, c.targetY, c.targetZ ?? 0);
     this.camera.position.set(
       target.x + c.distance * Math.cos(pitch) * Math.sin(yaw),
       target.y + c.distance * Math.sin(pitch),
@@ -119,6 +289,11 @@ export class Stage {
     );
     this.camera.fov = c.fov;
     this.camera.lookAt(target);
+    this.camera.aspect = this.aspect;
+    this.camera.updateProjectionMatrix();
+    this.camera.updateMatrixWorld();
+    // カメラを見る視線は、カメラが動くと変わる
+    if (this.state.people.some((p) => p.gaze?.kind === "camera")) this.apply();
   }
 
   render() {
@@ -127,7 +302,40 @@ export class Stage {
     this.renderer.render(this.scene, this.camera);
   }
 
-  /** 下絵を撮る。width × height(px)の PNG を返す */
+  /** 画面の位置(-1〜1)にある、つかむ点か人物 */
+  pick(nx: number, ny: number): Pick {
+    this.raycaster.setFromCamera(new THREE.Vector2(nx, ny), this.camera);
+    const handle = this.raycaster.intersectObjects(this.handles.children.filter((o) => o.userData.limb), false)[0];
+    if (handle) return { kind: "handle", person: handle.object.userData.person, limb: handle.object.userData.limb };
+    let best: { person: number; distance: number } | null = null;
+    this.figures.forEach((f, i) => {
+      const hit = this.raycaster.intersectObjects(f.meshes, false)[0];
+      if (hit && (!best || hit.distance < best.distance)) best = { person: i, distance: hit.distance };
+    });
+    return best ? { kind: "person", person: (best as { person: number }).person } : null;
+  }
+
+  /** 画面の位置と床(y = 0)の交点 */
+  floorPoint(nx: number, ny: number): THREE.Vector3 | null {
+    this.raycaster.setFromCamera(new THREE.Vector2(nx, ny), this.camera);
+    return this.raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), new THREE.Vector3());
+  }
+
+  /** つかんだ手足の先を、画面の位置へ動かしたときの位置(カメラに向いた面の上で動かす)。人物から見た位置で返す */
+  dragLimb(person: number, limb: LimbId, nx: number, ny: number): Vec3 | null {
+    const f = this.figures[person];
+    if (!f) return null;
+    const current = f.bonePosition(LIMBS[limb].bones[2])!;
+    const normal = this.camera.getWorldDirection(new THREE.Vector3());
+    this.raycaster.setFromCamera(new THREE.Vector2(nx, ny), this.camera);
+    const hit = this.raycaster.ray.intersectPlane(new THREE.Plane().setFromNormalAndCoplanarPoint(normal, current), new THREE.Vector3());
+    if (!hit) return null;
+    const local = f.toLocal(hit);
+    const r = (v: number) => Math.round(v * 1000) / 1000;
+    return [r(local.x), r(local.y), r(local.z)];
+  }
+
+  /** 下絵を撮る。width × height(px)の PNG を返す。つかむ点は写さない */
   async capture(width: number, height: number): Promise<Uint8Array> {
     const target = new THREE.WebGLRenderTarget(width, height, { samples: 4 });
     // 画面と同じ色にする(指定しないと、暗い色で読み出される)
@@ -135,11 +343,13 @@ export class Stage {
     const camera = this.camera.clone();
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
+    this.handles.visible = false;
     this.renderer.setRenderTarget(target);
     this.renderer.render(this.scene, camera);
     const pixels = new Uint8Array(width * height * 4);
     this.renderer.readRenderTargetPixels(target, 0, 0, width, height, pixels);
     this.renderer.setRenderTarget(null);
+    this.handles.visible = true;
     target.dispose();
     // WebGL の画素は下から上の順なので、上下を反転して画像にする
     const canvas = document.createElement("canvas");
@@ -157,6 +367,8 @@ export class Stage {
   dispose() {
     this.loading++;
     this.figures.forEach((f) => f.dispose());
+    this.clear(this.extras);
+    this.clear(this.handles);
     this.renderer.dispose();
   }
 }
