@@ -133,13 +133,15 @@ export function equipmentImage(e: EurosEquipment): { revisionId: string | null; 
   return e.image ? { revisionId: null, image: e.image } : null;
 }
 
-/** 装備品の型と寸法(cm)を、小物の形にする。型がなければ寸法の比から決める */
+/** 装備品の型と寸法(cm)を、小物の形にする。型がなければ名前と説明、それもなければ寸法の比から決める。寸法がなければ型の初期値 */
 export function equipmentShape(e: EurosEquipment): { kind: PropKind; lengthCm: number; widthCm: number; heightCm: number } {
   const size = e.size as Record<string, unknown> | undefined;
   const length = num(size, "lengthCm", "length", "heightCm", "height");
   const width = num(size, "widthCm", "width", "diameterCm", "diameter", "thicknessCm", "thickness");
   const thick = num(size, "thicknessCm", "thickness", "depthCm", "depth");
-  let kind = SHAPE_ALIASES.find(([re]) => re.test(e.shape ?? ""))?.[1];
+  // 型がなければ、名前と説明から決める(いまの Euros の装備品は型を持たない)
+  const text = `${equipmentName(e).ja} ${equipmentName(e).en} ${e.description?.en ?? ""} ${e.description?.ja ?? ""}`;
+  let kind = SHAPE_ALIASES.find(([re]) => re.test(e.shape ?? ""))?.[1] ?? SHAPE_ALIASES.find(([re]) => re.test(text))?.[1];
   if (!kind) kind = length && width && length > width * 2.5 ? "stick" : "box";
   const d = PROP_KINDS[kind].size;
   if (kind === "box") return { kind, lengthCm: num(size, "widthCm", "width") ?? d.lengthCm, widthCm: thick ?? d.widthCm, heightCm: num(size, "heightCm", "height", "lengthCm", "length") ?? d.heightCm };

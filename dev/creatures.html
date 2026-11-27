@@ -50,11 +50,19 @@ if (q.get("sketch")) {
   stage.setCamera(s.camera);
   const img = show(await stage.capture(w, h), "下絵", w);
   img.id = "sketch";
-  const characters = {
+  // window.__input = { characters, equipment }(Euros のキャラクターと装備品)を渡すと、それでプロンプトを作る
+  const input = window.__input ?? {};
+  const characters = input.characters ?? {
     suzu: { id: "suzu", profile: { name: "天音 鈴" } },
     slime: { id: "slime", profile: { name: "スライム" }, sheet: { notHuman: true } },
   };
-  document.getElementById("prompt").textContent = buildPrompt(s, characters);
+  const equipment = input.equipment ?? {};
+  const ids = Object.keys(characters);
+  s.people[0].characterId = ids.find((k) => !characters[k].sheet?.notHuman) ?? "suzu";
+  s.creatures[0].characterId = ids.find((k) => characters[k].sheet?.notHuman) ?? "slime";
+  const bat = Object.values(equipment)[0];
+  if (bat) s.props[0] = { ...s.props[0], equipment: { id: bat.id, revisionId: null }, name: { ja: bat.name, en: bat.description?.en ?? "" } };
+  document.getElementById("prompt").textContent = buildPrompt(s, characters, equipment);
 } else {
   stage.resize(480, 360);
   const cam = { ...DEFAULT_CAMERA, yaw: 40, pitch: 12, distance: 5.2, targetY: 0.9, targetZ: 0.5 };

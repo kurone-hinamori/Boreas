@@ -184,8 +184,9 @@ Euros(読むだけ)                 Notos(読むだけ)
 **M3 で読んでいる装備品の形(Euros の文書が決まるまでの仮の形)**
 
 - 場所:Euros のライブラリの `equipment/<id>/equipment.json`(`app: "Euros"`)。画像は `designs/`・`sheets/`・`images/`・`refs/` の中だけを読む。
-- `name`(文字列か `{ ja, en }`)、`description`(`{ ja, en }`)、`shape`(3D の目安の型:`bat`・`blade`/`sword`・`rod`/`stick`・`cylinder`・`ball`・`box`。日本語の `バット`・`刃物`・`棒`・`円柱`・`球`・`箱` も読む)、`size`(cm:`lengthCm`・`widthCm`・`thicknessCm`・`heightCm`・`diameterCm`)、`revisions[].image` と `currentRevision`(デザインの画像)。
-- 型がなければ、寸法の比(長さが太さの 2.5 倍より長ければ棒、そうでなければ箱)で決める。
+- `name`(文字列か `{ ja, en }`)、`description`(`{ ja, en }`)、`shape`(3D の目安の型:`bat`・`blade`/`sword`・`rod`/`stick`・`cylinder`・`ball`・`box`。日本語の `バット`・`刃物`・`棒`・`円柱`・`球`・`箱` も読む)、`size`(cm:`lengthCm`・`widthCm`・`thicknessCm`・`heightCm`・`diameterCm`)、`revisions[].image` と `currentRevision`、または `image`(デザインの画像)。
+- 型がなければ名前と説明(「金属バット」→ バット)から、それでも決まらなければ寸法の比(長さが太さの 2.5 倍より長ければ棒、そうでなければ箱)で決める。寸法がなければ型の初期値(バットは長さ 84cm)。
+- 2026-11-27 時点の Euros の装備品は `name`(文字列)・`description`・`category`・`image`(`refs/…`)だけで、型と寸法はまだない(10章)。
 - 場面には `equipment: { id, revisionId }` を残し、寸法は Euros の値のまま変えない(画面でも直せない)。デザインの画像は、登場人物のシートの次の Picture として渡す。
 
 ### 5.6 AI による自動化(Ollama)
