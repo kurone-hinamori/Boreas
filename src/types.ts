@@ -41,6 +41,8 @@ export interface CharacterSummary {
   updatedAt: string | null;
   /** いまの版のシート("sheets/<id>.png")。まだなければ null */
   sheet: string | null;
+  /** 人ではない登場人物(Euros の sheet.notHuman) */
+  notHuman: boolean;
 }
 
 /** 場面と場所は、中身を作るまで一覧に出す分だけ決めておく */

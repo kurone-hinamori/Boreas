@@ -6,6 +6,7 @@ export const PROP_KINDS = {
   bat: { label: "バット", en: "baseball bat", long: true, size: { lengthCm: 84, widthCm: 6.6, heightCm: 0 } },
   sword: { label: "剣", en: "sword", long: true, size: { lengthCm: 100, widthCm: 5, heightCm: 0 } },
   stick: { label: "棒・杖", en: "stick", long: true, size: { lengthCm: 120, widthCm: 3, heightCm: 0 } },
+  cylinder: { label: "円柱", en: "cylinder", long: true, size: { lengthCm: 30, widthCm: 8, heightCm: 0 } },
   ball: { label: "球", en: "ball", long: false, size: { lengthCm: 22, widthCm: 22, heightCm: 0 } },
   box: { label: "箱", en: "box", long: false, size: { lengthCm: 40, widthCm: 30, heightCm: 30 } },
 } as const;
@@ -62,7 +63,8 @@ export function propMesh(shape: PropShape, color: number): THREE.Group {
       break;
     }
     case "stick":
-      add(new THREE.CylinderGeometry(W / 2, W / 2, L, 14), base + L / 2);
+    case "cylinder":
+      add(new THREE.CylinderGeometry(W / 2, W / 2, L, shape.kind === "stick" ? 14 : 24), base + L / 2);
       break;
     case "ball":
       add(new THREE.SphereGeometry(L / 2, 24, 16), L / 2);
@@ -82,4 +84,70 @@ export function dirFromAngles(yaw: number, pitch: number): [number, number, numb
   const y = THREE.MathUtils.degToRad(yaw);
   const p = THREE.MathUtils.degToRad(pitch);
   return [Math.cos(p) * Math.sin(y), Math.sin(p), Math.cos(p) * Math.cos(y)];
+}
+
+// ---------------------------------------------------------------- Euros の装備品(読むだけ)
+
+/** Boreas が使う分だけの Euros の装備品(形は Euros の docs/character-format.md で決まるまでの仮の形) */
+export interface EurosEquipment {
+  id: string;
+  /** 名前。文字列か、日本語と英語 */
+  name?: string | { ja?: string; en?: string };
+  /** 見た目の説明 */
+  description?: { ja?: string; en?: string };
+  /** 3D の目安の型(棒・刃物・箱・円柱など) */
+  shape?: string;
+  /** 寸法(cm) */
+  size?: Record<string, unknown>;
+  /** デザインの画像 */
+  revisions?: { id: string; image?: string }[];
+  currentRevision?: string;
+  image?: string;
+}
+
+/** 型の名前(英語・日本語)→ 小物の型 */
+const SHAPE_ALIASES: [RegExp, PropKind][] = [
+  [/bat|バット/i, "bat"],
+  [/blade|sword|knife|katana|刃|剣|刀|ナイフ/i, "sword"],
+  [/rod|stick|staff|pole|spear|棒|杖|槍/i, "stick"],
+  [/cylinder|tube|円柱|筒/i, "cylinder"],
+  [/ball|sphere|orb|球|玉/i, "ball"],
+  [/box|bag|case|cube|箱|鞄|袋/i, "box"],
+];
+
+const num = (o: Record<string, unknown> | undefined, ...keys: string[]) => {
+  for (const k of keys) {
+    const v = o?.[k];
+    if (typeof v === "number" && v > 0) return v;
+  }
+  return undefined;
+};
+
+export const equipmentName = (e: EurosEquipment): { ja: string; en: string } =>
+  typeof e.name === "string" ? { ja: e.name, en: "" } : { ja: e.name?.ja ?? "", en: e.name?.en ?? "" };
+
+/** 採用中の版のデザインの画像 */
+export function equipmentImage(e: EurosEquipment): { revisionId: string | null; image: string } | null {
+  const r = e.revisions?.find((x) => x.id === e.currentRevision);
+  if (r?.image) return { revisionId: r.id, image: r.image };
+  return e.image ? { revisionId: null, image: e.image } : null;
+}
+
+/** 装備品の型と寸法(cm)を、小物の形にする。型がなければ名前と説明、それもなければ寸法の比から決める。寸法がなければ型の初期値 */
+export function equipmentShape(e: EurosEquipment): { kind: PropKind; lengthCm: number; widthCm: number; heightCm: number } {
+  const size = e.size as Record<string, unknown> | undefined;
+  const length = num(size, "lengthCm", "length", "heightCm", "height");
+  const width = num(size, "widthCm", "width", "diameterCm", "diameter", "thicknessCm", "thickness");
+  const thick = num(size, "thicknessCm", "thickness", "depthCm", "depth");
+  // 型がなければ、名前と説明から決める(いまの Euros の装備品は型を持たない)
+  const text = `${equipmentName(e).ja} ${equipmentName(e).en} ${e.description?.en ?? ""} ${e.description?.ja ?? ""}`;
+  let kind = SHAPE_ALIASES.find(([re]) => re.test(e.shape ?? ""))?.[1] ?? SHAPE_ALIASES.find(([re]) => re.test(text))?.[1];
+  if (!kind) kind = length && width && length > width * 2.5 ? "stick" : "box";
+  const d = PROP_KINDS[kind].size;
+  if (kind === "box") return { kind, lengthCm: num(size, "widthCm", "width") ?? d.lengthCm, widthCm: thick ?? d.widthCm, heightCm: num(size, "heightCm", "height", "lengthCm", "length") ?? d.heightCm };
+  if (kind === "ball") {
+    const dia = num(size, "diameterCm", "diameter", "widthCm", "width", "lengthCm", "length") ?? d.lengthCm;
+    return { kind, lengthCm: dia, widthCm: dia, heightCm: 0 };
+  }
+  return { kind, lengthCm: length ?? d.lengthCm, widthCm: width ?? d.widthCm, heightCm: 0 };
 }
