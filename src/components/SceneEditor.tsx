@@ -3,26 +3,48 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import type { CharacterSummary, Settings } from "../types";
 import { BODY_PARTS, type BodyPart, FIGURES, type FigureId, HAND_SHAPES, type HandShape, LIMBS, type LimbId, PERSON_COLORS } from "../lib/figures";
 import { POSES, type PoseId } from "../lib/poses";
-import { PROP_COLORS, PROP_KINDS, type PropKind } from "../lib/props";
+import { equipmentImage, equipmentName, equipmentShape, type EurosEquipment, PROP_COLORS, PROP_KINDS, type PropKind } from "../lib/props";
 import {
+  CREATURE_FORMS,
+  CREATURE_PARTS,
+  type CreatureForm,
+  type CreatureJoints,
+  type CreaturePart,
+  creatureTop,
+  type Exaggeration,
+  isExaggerated,
+  NO_EXAGGERATION,
+  partsOf,
+  sizeLabel,
+  STANCES,
+  type Stance,
+} from "../lib/creatures";
+import {
+  changeForm,
+  creatureFrom,
+  describe,
   emptyText,
   type EurosCharacter,
   FRAMES,
   type FrameId,
   freeColor,
-  MAX_PEOPLE,
+  MAX_CHARACTERS,
   newId,
   normalizeScene,
   personFrom,
+  removeCreature,
   removePerson,
   removeProp,
   type Scene,
   type SceneContact,
+  type SceneCreature,
   type ScenePerson,
   type SceneProp,
+  usedColors,
 } from "../lib/scene";
-import type { ContactFrom, Gaze, StageCamera } from "../lib/stage";
-import { deleteScene, listEurosCharacters, loadEurosCharacter, loadScene, openSceneFolder, saveScene } from "../lib/storage";
+import { type ContactFrom, type ContactTo, type Gaze, isCreatureTarget, type StageCamera } from "../lib/stage";
+import { estimateBody } from "../lib/ollama";
+import { deleteScene, listEurosCharacters, listEurosEquipment, loadEurosCharacter, loadScene, openSceneFolder, saveScene } from "../lib/storage";
 import { Viewport, type ViewportHandle } from "./Viewport";
 import { RefinePanel } from "./RefinePanel";
 
@@ -44,6 +66,41 @@ function Slider(props: { label: string; value: number; min: number; max: number;
   );
 }
 
+/** 誇張の倍率(全体・長さ・太さ)。誇張しているときは印を出す */
+function ScaleEditor({ value, onChange, lengthLabel = "長さ", widthLabel = "太さ" }: { value: Exaggeration | undefined; onChange: (s: Exaggeration) => void; lengthLabel?: string; widthLabel?: string }) {
+  const s = value ?? NO_EXAGGERATION;
+  return (
+    <details className="exaggerate" open={isExaggerated(value)}>
+      <summary>
+        大きさの誇張{isExaggerated(value) && <span className="tag">誇張 ×{Math.round(s.all * Math.max(s.length, s.width) * 100) / 100}</span>}
+      </summary>
+      <Slider label="全体" unit="倍" value={s.all} min={0.5} max={3} step={0.05} onChange={(v) => onChange({ ...s, all: v })} />
+      <div className="two">
+        <Slider label={lengthLabel} unit="倍" value={s.length} min={0.5} max={3} step={0.05} onChange={(v) => onChange({ ...s, length: v })} />
+        <Slider label={widthLabel} unit="倍" value={s.width} min={0.5} max={3} step={0.05} onChange={(v) => onChange({ ...s, width: v })} />
+      </div>
+      <div className="row" style={{ marginBottom: 0 }}>
+        <small className="muted">この場面だけの大きさです。Euros の寸法は変えません。</small>
+        {isExaggerated(value) && (
+          <button className="small" onClick={() => onChange({ ...NO_EXAGGERATION })}>
+            実際の大きさに戻す
+          </button>
+        )}
+      </div>
+    </details>
+  );
+}
+
+/** 人ではない登場人物の色の印と名前 */
+function WhoCreature({ c }: { c: SceneCreature }) {
+  return (
+    <>
+      <span className="swatch round" style={{ background: hex(PERSON_COLORS[c.color % PERSON_COLORS.length].hex) }} />
+      {c.name}
+    </>
+  );
+}
+
 /** 人物の色の印と名前 */
 function Who({ p }: { p: ScenePerson }) {
   return (
@@ -57,7 +114,9 @@ function Who({ p }: { p: ScenePerson }) {
 /** 枠に人物を収めるカメラ。extent は写す縦の長さ(身長に対する割合)、center はその中心の高さ */
 function framing(scene: Scene, extent: number, center: number): StageCamera {
   const c = scene.camera;
-  const people = scene.people.length ? scene.people : [{ x: 0, z: 0, heightCm: 160 }];
+  // 人ではない登場人物も、いちばん上の高さを身長とみなして収める
+  const all = [...scene.people, ...scene.creatures.map((cr) => ({ x: cr.x, z: cr.z, heightCm: creatureTop(cr) * 100 }))];
+  const people = all.length ? all : [{ x: 0, z: 0, heightCm: 160 }];
   const h = Math.max(...people.map((p) => p.heightCm)) / 100;
   const xs = people.map((p) => p.x);
   const zs = people.map((p) => p.z);
@@ -72,7 +131,10 @@ function framing(scene: Scene, extent: number, center: number): StageCamera {
   return { ...c, distance: r(distance), targetY: r(h * center), targetX: r(cx), targetZ: r(cz) };
 }
 
-type Tab = "people" | "props" | "contacts" | "camera";
+type Tab = "people" | "creatures" | "props" | "contacts" | "camera";
+
+/** 大きさ(m)を cm の入力にする */
+const toCm = (m: number) => Math.round(m * 1000) / 10;
 
 export function SceneEditor({ id, settings, onBack }: { id: string; settings: Settings; onBack: () => void }) {
   const [scene, setScene] = useState<Scene | null>(null);
@@ -81,6 +143,9 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
   const [eurosList, setEurosList] = useState<CharacterSummary[]>([]);
   const [saveState, setSaveState] = useState<"saved" | "saving" | "error">("saved");
   const [selected, setSelected] = useState<number | null>(null);
+  const [selectedCreature, setSelectedCreature] = useState<number | null>(null);
+  const [equipment, setEquipment] = useState<Record<string, EurosEquipment>>({});
+  const [estimating, setEstimating] = useState("");
   const [tab, setTab] = useState<Tab>("people");
   const viewport = useRef<ViewportHandle>(null);
   const saveTimer = useRef<number | undefined>(undefined);
@@ -92,12 +157,17 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
         const s = normalizeScene(raw);
         setScene(s);
         setSelected(s.people.length ? 0 : null);
-        const loaded = await Promise.all(s.people.map((p) => loadEurosCharacter(p.characterId).catch(() => null)));
+        setSelectedCreature(s.creatures.length ? 0 : null);
+        const ids = [...new Set([...s.people, ...s.creatures].map((p) => p.characterId))];
+        const loaded = await Promise.all(ids.map((cid) => loadEurosCharacter(cid).catch(() => null)));
         setCharacters(Object.fromEntries(loaded.filter((c): c is EurosCharacter => !!c).map((c) => [c.id, c])));
       })
       .catch((e) => setError(message(e)));
     listEurosCharacters()
       .then(setEurosList)
+      .catch(() => undefined);
+    listEurosEquipment()
+      .then((list) => setEquipment(Object.fromEntries(list.map((e) => [e.id, e]))))
       .catch(() => undefined);
   }, [id]);
 
@@ -149,6 +219,13 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
   const setPerson = (patch: Partial<ScenePerson>) => selected !== null && setPersonAt(selected, patch);
   const setCamera = (c: StageCamera) => change((s) => ({ ...s, camera: c }));
   const setProp = (i: number, patch: Partial<SceneProp>) => change((s) => ({ ...s, props: s.props.map((p, k) => (k === i ? { ...p, ...patch } : p)) }));
+  const selC = selectedCreature !== null ? scene.creatures[selectedCreature] : undefined;
+  const setCreatureAt = (i: number, patch: Partial<SceneCreature>) => change((s) => ({ ...s, creatures: s.creatures.map((c, k) => (k === i ? { ...c, ...patch } : c)) }));
+  const setCreature = (patch: Partial<SceneCreature>) => selectedCreature !== null && setCreatureAt(selectedCreature, patch);
+  const setJoints = (patch: Partial<CreatureJoints>) => selC && setCreature({ joints: { ...selC.joints, ...patch } });
+  const characterCount = scene.people.length + scene.creatures.length;
+  const humans = eurosList.filter((c) => !c.notHuman);
+  const nonHumans = eurosList.filter((c) => c.notHuman);
 
   const loadCharacter = async (characterId: string) => {
     const c = await loadEurosCharacter(characterId);
@@ -157,11 +234,12 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
   };
 
   const addPerson = async (characterId: string) => {
-    if (!characterId || scene.people.length >= MAX_PEOPLE) return;
+    if (!characterId || characterCount >= MAX_CHARACTERS) return;
     try {
       const c = await loadCharacter(characterId);
+      if (c.sheet?.notHuman) return addCreature(c);
       change((s) => {
-        const p = personFrom(c, freeColor(s.people.map((x) => x.color), PERSON_COLORS.length));
+        const p = personFrom(c, freeColor(usedColors(s), PERSON_COLORS.length));
         // 2人目からは、横に並べて互いに向き合わせる
         const n = s.people.length;
         const placed = n === 0 ? p : { ...p, x: n % 2 ? 0.7 * Math.ceil(n / 2) : -0.7 * Math.ceil(n / 2), rotation: n % 2 ? -60 : 60 };
@@ -171,6 +249,55 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
     } catch (e) {
       setError(message(e));
     }
+  };
+
+  /** 人ではない登場人物を足す。人物の正面(1m ほど前)に、人物の方を向けて置く */
+  const addCreature = (c: EurosCharacter) => {
+    change((s) => ({ ...s, creatures: [...s.creatures, creatureFrom(c, freeColor(usedColors(s), PERSON_COLORS.length))] }));
+    setSelectedCreature(scene.creatures.length);
+    setTab("creatures");
+  };
+
+  const addCreatureById = async (characterId: string) => {
+    if (!characterId || characterCount >= MAX_CHARACTERS) return;
+    try {
+      addCreature(await loadCharacter(characterId));
+    } catch (e) {
+      setError(message(e));
+    }
+  };
+
+  const replaceCreature = async (characterId: string) => {
+    if (selectedCreature === null || !characterId) return;
+    try {
+      const c = await loadCharacter(characterId);
+      const next = creatureFrom(c, scene.creatures[selectedCreature].color);
+      setCreature({ characterId: next.characterId, revisionId: next.revisionId, name: next.name, body: next.body, bodyFrom: next.bodyFrom });
+    } catch (e) {
+      setError(message(e));
+    }
+  };
+
+  /** 説明から形の種類と大きさを推定する(Ollama) */
+  const estimate = async () => {
+    if (!selC) return;
+    const c = characters[selC.characterId];
+    if (!c) return;
+    const index = selectedCreature!;
+    setEstimating("推定しています…");
+    try {
+      const body = await estimateBody(settings, describe(c));
+      setCreatureAt(index, { body, bodyFrom: "guess" });
+      setEstimating("");
+    } catch (e) {
+      setEstimating(`推定できませんでした:${message(e)}`);
+    }
+  };
+
+  const deleteCreature = () => {
+    if (selectedCreature === null) return;
+    change((s) => removeCreature(s, selectedCreature));
+    setSelectedCreature(scene.creatures.length > 1 ? 0 : null);
   };
 
   const replaceCharacter = async (characterId: string) => {
@@ -209,10 +336,39 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
     change((s) => ({ ...s, props: [...s.props, prop] }));
   };
 
+  /** Euros の装備品を置く。寸法と型は Euros の値、色は小物の色 */
+  const addEquipment = (id: string) => {
+    const e = equipment[id];
+    if (!e) return;
+    const shape = equipmentShape(e);
+    const long = PROP_KINDS[shape.kind].long;
+    const name = equipmentName(e);
+    const prop: SceneProp = {
+      id: newId(),
+      ...shape,
+      grip: long ? 0.12 : 0.5,
+      color: freeColor(scene.props.map((p) => p.color), PROP_COLORS.length),
+      holder: long && selected !== null ? { person: selected, side: "r" } : null,
+      x: 0.4,
+      z: 0.3,
+      yaw: 0,
+      pitch: long ? 60 : 0,
+      name: { ja: [name.ja, e.description?.ja].filter(Boolean).join("。"), en: [name.en, e.description?.en].filter(Boolean).join(", ") },
+      equipment: { id: e.id, revisionId: equipmentImage(e)?.revisionId ?? null },
+    };
+    change((s) => ({ ...s, props: [...s.props, prop] }));
+  };
+
   const addContact = () => {
-    const from: ContactFrom = { kind: "hand", person: selected ?? 0, side: "r" };
-    const other = scene.people.findIndex((_, i) => i !== (selected ?? 0));
-    const contact: SceneContact = { id: newId(), from, to: { person: other >= 0 ? other : 0, part: "shoulder_l" } };
+    const me = selected ?? 0;
+    // 選んでいる人物が長い物を持っていれば、その先から
+    const held = scene.props.findIndex((p) => p.holder?.person === me && PROP_KINDS[p.kind].long);
+    const from: ContactFrom = held >= 0 ? { kind: "prop", prop: held } : { kind: "hand", person: me, side: "r" };
+    const other = scene.people.findIndex((_, i) => i !== me);
+    // 相手はほかの人物、いなければ人ではない登場人物
+    const to: ContactTo =
+      other < 0 && scene.creatures.length ? { creature: 0, part: partsOf(scene.creatures[0].body)[0] } : { person: other >= 0 ? other : 0, part: "shoulder_l" };
+    const contact: SceneContact = { id: newId(), from, to };
     change((s) => ({ ...s, contacts: [...s.contacts, contact] }));
   };
 
@@ -234,7 +390,16 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
     ...scene.props.flatMap((pr, k) => (PROP_KINDS[pr.kind].long ? [{ key: `p${k}`, label: `${pr.name.ja || PROP_KINDS[pr.kind].label}の先`, value: { kind: "prop" as const, prop: k } }] : [])),
   ];
   const fromKey = (f: ContactFrom) => (f.kind === "hand" ? `h${f.person}${f.side}` : `p${f.prop}`);
-  const gazeKey = (g: Gaze | undefined) => (!g || g.kind === "manual" ? "manual" : g.kind === "camera" ? "camera" : `p${g.index}`);
+  const gazeKey = (g: Gaze | undefined) => (!g || g.kind === "manual" ? "manual" : g.kind === "camera" ? "camera" : g.kind === "creature" ? `c${g.index}` : `p${g.index}`);
+  // 触れる点の「相手」の選択肢(人物と、人ではない登場人物)
+  const toKey = (t: ContactTo) => (isCreatureTarget(t) ? `c${t.creature}` : `p${t.person}`);
+  const partsFor = (t: ContactTo): { id: string; label: string }[] =>
+    isCreatureTarget(t)
+      ? scene.creatures[t.creature]
+        ? partsOf(scene.creatures[t.creature].body).map((p) => ({ id: p, label: CREATURE_PARTS[p].label }))
+        : []
+      : (Object.keys(BODY_PARTS) as BodyPart[]).map((p) => ({ id: p, label: BODY_PARTS[p].label }));
+  const setContactTo = (k: number, to: ContactTo) => change((s) => ({ ...s, contacts: s.contacts.map((x, i) => (i === k ? { ...x, to } : x)) }));
 
   return (
     <div className="page wide">
@@ -259,6 +424,7 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
             {(
               [
                 ["people", `人物(${scene.people.length})`],
+                ["creatures", `人ではない(${scene.creatures.length})`],
                 ["props", `小物(${scene.props.length})`],
                 ["contacts", `触れる(${scene.contacts.length})`],
                 ["camera", "カメラ"],
@@ -280,12 +446,12 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
                     </button>
                   ))}
                 </div>
-                {scene.people.length < MAX_PEOPLE ? (
+                {characterCount < MAX_CHARACTERS ? (
                   <label className="field" style={{ marginBottom: 0 }}>
-                    <span>人物を足す(Euros のキャラクター。最大{MAX_PEOPLE}人)</span>
+                    <span>人物を足す(Euros のキャラクター。人ではない登場人物と合わせて最大{MAX_CHARACTERS}人)</span>
                     <select value="" onChange={(e) => void addPerson(e.target.value)}>
                       <option value="">(選ぶ)</option>
-                      {eurosList.map((c) => (
+                      {humans.map((c) => (
                         <option key={c.id} value={c.id} disabled={!c.sheet}>
                           {c.name || "(名前なし)"}
                           {!c.sheet && "(シートなし)"}
@@ -294,7 +460,7 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
                     </select>
                   </label>
                 ) : (
-                  <small className="muted">これ以上は足せません(最大{MAX_PEOPLE}人)。</small>
+                  <small className="muted">これ以上は足せません(人ではない登場人物と合わせて最大{MAX_CHARACTERS}人)。</small>
                 )}
               </section>
 
@@ -307,7 +473,7 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
                     <label className="field">
                       <span>Euros のキャラクター</span>
                       <select value={sel.characterId} onChange={(e) => void replaceCharacter(e.target.value)}>
-                        {eurosList.map((c) => (
+                        {humans.map((c) => (
                           <option key={c.id} value={c.id} disabled={!c.sheet}>
                             {c.name || "(名前なし)"}
                           </option>
@@ -375,7 +541,14 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
                         value={gazeKey(sel.gaze)}
                         onChange={(e) => {
                           const v = e.target.value;
-                          setPerson({ gaze: v === "manual" ? { kind: "manual" } : v === "camera" ? { kind: "camera" } : { kind: "person", index: Number(v.slice(1)) } });
+                          setPerson({
+                            gaze:
+                              v === "manual"
+                                ? { kind: "manual" }
+                                : v === "camera"
+                                  ? { kind: "camera" }
+                                  : { kind: v[0] === "c" ? "creature" : "person", index: Number(v.slice(1)) },
+                          });
                         }}
                       >
                         <option value="manual">顔の向きで決める</option>
@@ -387,6 +560,11 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
                             </option>
                           ),
                         )}
+                        {scene.creatures.map((c, i) => (
+                          <option key={`c${i}`} value={`c${i}`}>
+                            {c.name}を見る
+                          </option>
+                        ))}
                       </select>
                     </label>
                     {gazeKey(sel.gaze) === "manual" && (
@@ -412,6 +590,181 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
             </>
           )}
 
+          {tab === "creatures" && (
+            <>
+              <section className="card">
+                <div className="chips">
+                  {scene.creatures.map((c, i) => (
+                    <button key={i} className={`chip${selectedCreature === i ? " active" : ""}`} onClick={() => setSelectedCreature(i)}>
+                      <WhoCreature c={c} />
+                    </button>
+                  ))}
+                </div>
+                {characterCount < MAX_CHARACTERS ? (
+                  <label className="field" style={{ marginBottom: 0 }}>
+                    <span>人ではない登場人物を足す(Euros で「人ではない」にしたキャラクター)</span>
+                    <select value="" onChange={(e) => void addCreatureById(e.target.value)}>
+                      <option value="">(選ぶ)</option>
+                      {nonHumans.map((c) => (
+                        <option key={c.id} value={c.id} disabled={!c.sheet}>
+                          {c.name || "(名前なし)"}
+                          {!c.sheet && "(シートなし)"}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : (
+                  <small className="muted">これ以上は足せません(人物と合わせて最大{MAX_CHARACTERS}人)。</small>
+                )}
+                {!nonHumans.length && <small className="muted">Euros に人ではない登場人物がありません。</small>}
+              </section>
+
+              {selC && selectedCreature !== null && (
+                <>
+                  <section className="card">
+                    <h3>
+                      <WhoCreature c={selC} />
+                      {isExaggerated(selC.scale) && <span className="tag">誇張</span>}
+                    </h3>
+                    <label className="field">
+                      <span>Euros のキャラクター</span>
+                      <select value={selC.characterId} onChange={(e) => void replaceCreature(e.target.value)}>
+                        {nonHumans.map((c) => (
+                          <option key={c.id} value={c.id} disabled={!c.sheet}>
+                            {c.name || "(名前なし)"}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>形の種類</span>
+                      <select value={selC.body.form} onChange={(e) => setCreature({ body: changeForm(selC.body, e.target.value as CreatureForm) })}>
+                        {(Object.keys(CREATURE_FORMS) as CreatureForm[]).map((f) => (
+                          <option key={f} value={f}>
+                            {CREATURE_FORMS[f].label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="two">
+                      {Object.keys(CREATURE_FORMS[selC.body.form].size).map((k) => (
+                        <label key={k} className="field">
+                          <span>{sizeLabel(selC.body.form, k)}(cm)</span>
+                          <input
+                            type="number"
+                            min={1}
+                            value={toCm(selC.body.size[k] ?? 0)}
+                            onChange={(e) => setCreature({ body: { ...selC.body, size: { ...selC.body.size, [k]: Math.max(1, Number(e.target.value) || 1) / 100 } } })}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                    {(selC.body.form === "quadruped" || selC.body.form === "biped") && (
+                      <div className="row">
+                        {selC.body.form === "biped" && (
+                          <label className="check">
+                            <input type="checkbox" checked={selC.body.arms !== false} onChange={(e) => setCreature({ body: { ...selC.body, arms: e.target.checked } })} />
+                            腕
+                          </label>
+                        )}
+                        <label className="check">
+                          <input type="checkbox" checked={selC.body.tail !== false} onChange={(e) => setCreature({ body: { ...selC.body, tail: e.target.checked } })} />
+                          尾
+                        </label>
+                      </div>
+                    )}
+                    <div className="row">
+                      <small className="muted">
+                        {selC.bodyFrom === "euros" ? "形と大きさは Euros の値です。" : "Euros に形と大きさがないので、説明から推定しました。直してください。"}
+                      </small>
+                      <button className="small" disabled={estimating.endsWith("…")} onClick={() => void estimate()}>
+                        説明から推定(Ollama)
+                      </button>
+                      {estimating && <small className={estimating.endsWith("…") ? "muted" : "error"}>{estimating}</small>}
+                    </div>
+                    <div className="two">
+                      <Slider label="左右の位置" unit="m" value={selC.x} min={-4} max={4} step={0.01} onChange={(v) => setCreature({ x: v })} />
+                      <Slider label="前後の位置" unit="m" value={selC.z} min={-4} max={4} step={0.01} onChange={(v) => setCreature({ z: v })} />
+                    </div>
+                    <Slider label="向き" unit="°" value={selC.rotation} min={-180} max={180} step={5} onChange={(v) => setCreature({ rotation: v })} />
+                    <small className="muted">3D の表示でドラッグしても動かせます。</small>
+                  </section>
+
+                  <section className="card">
+                    <h3>形・ポーズ</h3>
+                    {selC.body.form === "sphere" && (
+                      <>
+                        <Slider label="浮く高さ" unit="m" value={selC.lift} min={0} max={3} step={0.01} onChange={(v) => setCreature({ lift: v })} />
+                        <div className="two">
+                          <Slider label="前後の傾き" unit="°" value={selC.tilt} min={-90} max={90} step={5} onChange={(v) => setCreature({ tilt: v })} />
+                          <Slider label="左右の傾き" unit="°" value={selC.roll} min={-90} max={90} step={5} onChange={(v) => setCreature({ roll: v })} />
+                        </div>
+                        <small className="muted">暗い丸が正面(目・レンズ)です。</small>
+                      </>
+                    )}
+                    {selC.body.form === "blob" && (
+                      <>
+                        <Slider label="つぶれ(+)・伸び(-)" value={selC.squash} min={-0.5} max={0.6} step={0.05} onChange={(v) => setCreature({ squash: v })} />
+                        <div className="two">
+                          <label className="field">
+                            <span>へこみ(叩かれた所など)</span>
+                            <select
+                              value={selC.dent?.part ?? ""}
+                              onChange={(e) => setCreature({ dent: e.target.value ? { part: e.target.value as CreaturePart, depth: selC.dent?.depth ?? 0.25 } : null })}
+                            >
+                              <option value="">なし</option>
+                              {partsOf(selC.body).map((p) => (
+                                <option key={p} value={p}>
+                                  {CREATURE_PARTS[p].label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          {selC.dent && <Slider label="へこみの深さ" value={selC.dent.depth} min={0} max={0.6} step={0.05} onChange={(v) => setCreature({ dent: { ...selC.dent!, depth: v } })} />}
+                        </div>
+                      </>
+                    )}
+                    {(selC.body.form === "quadruped" || selC.body.form === "biped") && (
+                      <>
+                        <div className="poses">
+                          {STANCES.filter((st) => selC.body.form === "quadruped" || st.id !== "leap").map((st) => (
+                            <button key={st.id} className={`small${selC.joints.stance === st.id ? " active" : ""}`} onClick={() => setJoints({ stance: st.id as Stance })}>
+                              {st.label}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="two">
+                          <Slider label="首の左右" unit="°" value={selC.joints.neckYaw} min={-70} max={70} step={5} onChange={(v) => setJoints({ neckYaw: v })} />
+                          <Slider label="首の上下(+で下)" unit="°" value={selC.joints.neckPitch} min={-45} max={60} step={5} onChange={(v) => setJoints({ neckPitch: v })} />
+                        </div>
+                        <div className="two">
+                          <Slider label="体を前に倒す" unit="°" value={selC.joints.lean} min={-30} max={60} step={5} onChange={(v) => setJoints({ lean: v })} />
+                          <Slider label="口を開く" value={selC.joints.mouth} min={0} max={1} step={0.05} onChange={(v) => setJoints({ mouth: v })} />
+                        </div>
+                        {selC.body.tail !== false && <Slider label="尾の上下" unit="°" value={selC.joints.tail} min={-40} max={90} step={5} onChange={(v) => setJoints({ tail: v })} />}
+                        {selC.body.form === "biped" && selC.body.arms !== false && (
+                          <div className="two">
+                            <Slider label="右腕を上げる" unit="°" value={selC.joints.armR} min={-30} max={180} step={5} onChange={(v) => setJoints({ armR: v })} />
+                            <Slider label="左腕を上げる" unit="°" value={selC.joints.armL} min={-30} max={180} step={5} onChange={(v) => setJoints({ armL: v })} />
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {selC.body.form === "object" && <small className="muted">物は置き方(位置と向き)だけを決めます。</small>}
+                    <ScaleEditor value={selC.scale} lengthLabel="高さ・体長" widthLabel="太さ・幅" onChange={(v) => setCreature({ scale: v })} />
+                    <label className="field">
+                      <span>動作(日本語)</span>
+                      <input value={selC.action.ja} placeholder="例:バットで叩かれて大きくへこむ" onChange={(e) => setCreature({ action: { ...selC.action, ja: e.target.value } })} />
+                    </label>
+                    <button className="small" onClick={deleteCreature}>
+                      場面から外す
+                    </button>
+                  </section>
+                </>
+              )}
+            </>
+          )}
+
           {tab === "props" && (
             <>
               <section className="card">
@@ -424,15 +777,34 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
                   ))}
                 </div>
                 <small className="muted">寸法は実際の大きさ(cm)です。長い物は、選んでいる人物の右手に持たせます。</small>
+                {Object.keys(equipment).length > 0 && (
+                  <label className="field" style={{ marginBottom: 0, marginTop: 8 }}>
+                    <span>Euros の装備品を足す(寸法とデザインの画像は Euros の値)</span>
+                    <select value="" onChange={(e) => addEquipment(e.target.value)}>
+                      <option value="">(選ぶ)</option>
+                      {Object.values(equipment).map((e) => (
+                        <option key={e.id} value={e.id}>
+                          {equipmentName(e).ja || equipmentName(e).en || "(名前なし)"}
+                          {!equipmentImage(e) && "(画像なし)"}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
               </section>
               {scene.props.map((pr, k) => {
                 const long = PROP_KINDS[pr.kind].long;
                 const holderKey = pr.holder ? `${pr.holder.person}${pr.holder.side}` : "floor";
+                // Euros の装備品の寸法は Euros の値のまま(大きさは誇張で変える)
+                const fixed = !!pr.equipment;
+                const eq = pr.equipment && equipment[pr.equipment.id];
                 return (
                   <section key={pr.id} className="card">
                     <h3>
                       <span className="swatch" style={{ background: hex(PROP_COLORS[pr.color % PROP_COLORS.length].hex) }} />
                       {PROP_KINDS[pr.kind].label}
+                      {pr.equipment && <span className="tag">Euros の装備品{eq ? `:${equipmentName(eq).ja || equipmentName(eq).en}` : "(見つかりません)"}</span>}
+                      {isExaggerated(pr.scale) && <span className="tag">誇張</span>}
                     </h3>
                     <label className="field">
                       <span>見た目(日本語)</span>
@@ -441,21 +813,22 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
                     <div className="two">
                       <label className="field">
                         <span>{long ? "長さ" : pr.kind === "ball" ? "直径" : "幅"}(cm)</span>
-                        <input type="number" min={1} value={pr.lengthCm} onChange={(e) => setProp(k, { lengthCm: Math.max(1, Number(e.target.value) || 1) })} />
+                        <input type="number" min={1} disabled={fixed} value={pr.lengthCm} onChange={(e) => setProp(k, { lengthCm: Math.max(1, Number(e.target.value) || 1) })} />
                       </label>
                       {pr.kind !== "ball" && (
                         <label className="field">
                           <span>{long ? "太さ" : "奥行き"}(cm)</span>
-                          <input type="number" min={0.5} value={pr.widthCm} onChange={(e) => setProp(k, { widthCm: Math.max(0.5, Number(e.target.value) || 1) })} />
+                          <input type="number" min={0.5} disabled={fixed} value={pr.widthCm} onChange={(e) => setProp(k, { widthCm: Math.max(0.5, Number(e.target.value) || 1) })} />
                         </label>
                       )}
                     </div>
                     {pr.kind === "box" && (
                       <label className="field">
                         <span>高さ(cm)</span>
-                        <input type="number" min={1} value={pr.heightCm} onChange={(e) => setProp(k, { heightCm: Math.max(1, Number(e.target.value) || 1) })} />
+                        <input type="number" min={1} disabled={fixed} value={pr.heightCm} onChange={(e) => setProp(k, { heightCm: Math.max(1, Number(e.target.value) || 1) })} />
                       </label>
                     )}
+                    <ScaleEditor value={pr.scale} onChange={(v) => setProp(k, { scale: v })} />
                     {long && (
                       <label className="field">
                         <span>持つ人</span>
@@ -505,7 +878,7 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
                   触れる点を足す
                 </button>
                 <p className="muted small-text" style={{ marginBottom: 0 }}>
-                  手や小物の先を、相手の体に寄せます。触れる点には黒い印を描き、プロンプトでも伝えます。
+                  手や小物の先を、相手の体に寄せます(人ではない登場人物にも)。触れる点の印は編集の画面にだけ出し、清書にはプロンプトで伝えます。
                 </p>
               </section>
               {scene.contacts.map((c, k) => (
@@ -529,20 +902,44 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
                   <div className="two">
                     <label className="field">
                       <span>相手</span>
-                      <select value={c.to.person} onChange={(e) => change((s) => ({ ...s, contacts: s.contacts.map((x, i) => (i === k ? { ...x, to: { ...x.to, person: Number(e.target.value) } } : x)) }))}>
+                      <select
+                        value={toKey(c.to)}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          const n = Number(v.slice(1));
+                          if (v[0] === "c") {
+                            // 部位は、前と同じものがなければ最初の部位(上・頭)にする
+                            const parts = scene.creatures[n] ? partsOf(scene.creatures[n].body) : [];
+                            const part = parts.includes(c.to.part as CreaturePart) ? (c.to.part as CreaturePart) : parts[0];
+                            if (part) setContactTo(k, { creature: n, part });
+                          } else {
+                            setContactTo(k, { person: n, part: c.to.part in BODY_PARTS ? (c.to.part as BodyPart) : "chest" });
+                          }
+                        }}
+                      >
                         {scene.people.map((p, i) => (
-                          <option key={i} value={i}>
+                          <option key={`p${i}`} value={`p${i}`}>
                             {p.name}
+                          </option>
+                        ))}
+                        {scene.creatures.map((cr, i) => (
+                          <option key={`c${i}`} value={`c${i}`}>
+                            {cr.name}
                           </option>
                         ))}
                       </select>
                     </label>
                     <label className="field">
                       <span>部位</span>
-                      <select value={c.to.part} onChange={(e) => change((s) => ({ ...s, contacts: s.contacts.map((x, i) => (i === k ? { ...x, to: { ...x.to, part: e.target.value as BodyPart } } : x)) }))}>
-                        {(Object.keys(BODY_PARTS) as BodyPart[]).map((part) => (
-                          <option key={part} value={part}>
-                            {BODY_PARTS[part].label}
+                      <select
+                        value={c.to.part}
+                        onChange={(e) =>
+                          setContactTo(k, isCreatureTarget(c.to) ? { ...c.to, part: e.target.value as CreaturePart } : { ...c.to, part: e.target.value as BodyPart })
+                        }
+                      >
+                        {partsFor(c.to).map((part) => (
+                          <option key={part.id} value={part.id}>
+                            {part.label}
                           </option>
                         ))}
                       </select>
@@ -602,13 +999,18 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
               if (i !== null) setTab("people");
             }}
             onMovePerson={(i, x, z) => setPersonAt(i, { x, z })}
+            onSelectCreature={(i) => {
+              setSelectedCreature(i);
+              setTab("creatures");
+            }}
+            onMoveCreature={(i, x, z) => setCreatureAt(i, { x, z })}
             onLimb={(i, limb, pos) => change((s) => ({ ...s, people: s.people.map((p, k) => (k === i ? { ...p, ik: { ...p.ik, [limb]: pos } } : p)) }))}
           />
-          <small className="muted">人物をクリックで選び、ドラッグで動かす。白い背景・床・黒い点は清書では描かれません。</small>
+          <small className="muted">人物・人ではない登場人物をクリックで選び、ドラッグで動かす。白い背景・床・黒い点は清書では描かれません。</small>
         </div>
       </div>
 
-      <RefinePanel scene={scene} characters={characters} settings={settings} viewport={viewport} change={change} flush={flush} />
+      <RefinePanel scene={scene} characters={characters} equipment={equipment} settings={settings} viewport={viewport} change={change} flush={flush} />
     </div>
   );
 }

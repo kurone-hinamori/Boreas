@@ -1,10 +1,25 @@
 import { BODY_PARTS, type FigureId, PERSON_COLORS } from "./figures";
 import { type PoseId, POSES } from "./poses";
-import { PROP_COLORS, PROP_KINDS } from "./props";
-import { DEFAULT_CAMERA, type StageCamera, type StageContact, type StagePerson, type StageProp } from "./stage";
+import { equipmentImage, type EurosEquipment, PROP_COLORS, PROP_KINDS } from "./props";
+import {
+  CREATURE_FORMS,
+  CREATURE_PARTS,
+  type CreatureBody,
+  DEFAULT_JOINTS,
+  defaultBody,
+  exaggeratedSize,
+  guessForm,
+  isExaggerated,
+  NO_EXAGGERATION,
+  parseBody,
+  SIZE_LABELS,
+  STANCES,
+  type StageCreature,
+} from "./creatures";
+import { DEFAULT_CAMERA, isCreatureTarget, type StageCamera, type StageContact, type StagePerson, type StageProp } from "./stage";
 
-/** 場面に置ける人物の数(参照画像の数と、描き分けの安定性から) */
-export const MAX_PEOPLE = PERSON_COLORS.length;
+/** 場面に置ける登場人物(人物と、人ではない登場人物を合わせて)の数(参照画像の数と、描き分けの安定性から) */
+export const MAX_CHARACTERS = PERSON_COLORS.length;
 
 /** scene.json の形の版。形を変えたら上げる */
 export const SCENE_SCHEMA_VERSION = 1;
@@ -44,11 +59,23 @@ export interface ScenePerson extends StagePerson {
   expression: Text;
 }
 
+/** 場面に置いた人ではない登場人物。見た目は Euros のシート(notHuman)、形と大きさは body */
+export interface SceneCreature extends StageCreature {
+  characterId: string;
+  revisionId: string | null;
+  name: string;
+  /** body を Euros から読んだか、説明から推定したか(推定したものは画面で直してもらう) */
+  bodyFrom: "euros" | "guess";
+  action: Text;
+}
+
 /** 場面に置いた小物。寸法は実際の大きさ(cm) */
 export interface SceneProp extends StageProp {
   id: string;
   /** 見た目の説明(清書のプロンプトに使う) */
   name: Text;
+  /** Euros の装備品から置いたときの、装備品の id と版の id(寸法は Euros の値のまま。大きさは誇張で変える) */
+  equipment?: { id: string; revisionId: string | null };
 }
 
 /** 触れる点(「Aの右手 → Bの肩」など) */
@@ -66,8 +93,8 @@ export interface Take {
   result: string | null;
   seed: number;
   prompt: string;
-  /** Picture 2 以降に渡したシート(Euros のキャラクターの id と版の id) */
-  sheets: { characterId: string; revisionId: string | null }[];
+  /** Picture 2 以降に渡したシート(Euros のキャラクター、または装備品の id と版の id) */
+  sheets: ({ characterId: string; revisionId: string | null } | { equipmentId: string; revisionId: string | null })[];
   /** ComfyUI に送ったワークフロー(API 形式) */
   workflow?: unknown;
   /** 失敗したときのエラー */
@@ -83,6 +110,7 @@ export interface Scene {
   updatedAt: string;
   frame: FrameId;
   people: ScenePerson[];
+  creatures: SceneCreature[];
   props: SceneProp[];
   contacts: SceneContact[];
   camera: StageCamera;
@@ -108,6 +136,7 @@ export function newScene(title: string): Scene {
     updatedAt: now,
     frame: "cover",
     people: [],
+    creatures: [],
     props: [],
     contacts: [],
     camera: { ...DEFAULT_CAMERA },
@@ -117,10 +146,11 @@ export function newScene(title: string): Scene {
   };
 }
 
-/** 前の版(M1)で作った場面に、あとから足した項目を補う */
+/** 前の版(M1・M2)で作った場面に、あとから足した項目を補う */
 export function normalizeScene(s: Scene): Scene {
   return {
     ...s,
+    creatures: (s.creatures ?? []).map((c) => ({ ...c, joints: { ...DEFAULT_JOINTS, ...c.joints } })),
     props: s.props ?? [],
     contacts: s.contacts ?? [],
     camera: { ...DEFAULT_CAMERA, ...s.camera },
@@ -144,10 +174,32 @@ export function removePerson(s: Scene, index: number): Scene {
       .map((p) => (p.gaze?.kind === "person" ? { ...p, gaze: p.gaze.index === index ? { kind: "manual" as const } : { kind: "person" as const, index: shift(p.gaze.index) } } : p)),
     props: s.props.map((pr) => (pr.holder ? (pr.holder.person === index ? { ...pr, holder: null } : { ...pr, holder: { ...pr.holder, person: shift(pr.holder.person) } }) : pr)),
     contacts: s.contacts
-      .filter((c) => c.to.person !== index && !(c.from.kind === "hand" && c.from.person === index))
-      .map((c) => ({ ...c, to: { ...c.to, person: shift(c.to.person) }, from: c.from.kind === "hand" ? { ...c.from, person: shift(c.from.person) } : c.from })),
+      .filter((c) => (isCreatureTarget(c.to) || c.to.person !== index) && !(c.from.kind === "hand" && c.from.person === index))
+      .map((c) => ({
+        ...c,
+        to: isCreatureTarget(c.to) ? c.to : { ...c.to, person: shift(c.to.person) },
+        from: c.from.kind === "hand" ? { ...c.from, person: shift(c.from.person) } : c.from,
+      })),
   };
 }
+
+/** 人ではない登場人物を消したときに、触れる点と視線を付け直す */
+export function removeCreature(s: Scene, index: number): Scene {
+  const shift = (i: number) => (i > index ? i - 1 : i);
+  return {
+    ...s,
+    creatures: s.creatures.filter((_, i) => i !== index),
+    people: s.people.map((p) =>
+      p.gaze?.kind === "creature" ? { ...p, gaze: p.gaze.index === index ? { kind: "manual" as const } : { kind: "creature" as const, index: shift(p.gaze.index) } } : p,
+    ),
+    contacts: s.contacts
+      .filter((c) => !(isCreatureTarget(c.to) && c.to.creature === index))
+      .map((c) => (isCreatureTarget(c.to) ? { ...c, to: { ...c.to, creature: shift(c.to.creature) } } : c)),
+  };
+}
+
+/** 場面の登場人物(人物と人ではない登場人物)が使っている色 */
+export const usedColors = (s: Scene) => [...s.people.map((p) => p.color), ...s.creatures.map((c) => c.color)];
 
 /** 小物を消したときに、触れる点を付け直す */
 export function removeProp(s: Scene, index: number): Scene {
@@ -169,9 +221,15 @@ export interface EurosCharacter {
   style?: string;
   appearance?: Partial<Record<string, Partial<Text>>>;
   sheet?: { notHuman?: boolean };
+  /** 人ではない登場人物の形と大きさ(m)。例:{ form: "sphere", size: { diameter: 0.4 } } */
+  body?: unknown;
+  /** 人物の身長(cm) */
+  heightCm?: number;
   revisions?: { id: string; image?: string }[];
   currentRevision?: string;
 }
+
+export const isNotHuman = (c: EurosCharacter) => !!c.sheet?.notHuman;
 
 /** 採用中の版のシート("sheets/<id>.png")と版の id */
 export function currentSheet(c: EurosCharacter): { revisionId: string; image: string } | null {
@@ -181,8 +239,9 @@ export function currentSheet(c: EurosCharacter): { revisionId: string; image: st
 
 const ja = (c: EurosCharacter, k: string) => `${c.appearance?.[k]?.ja ?? ""} ${c.appearance?.[k]?.en ?? ""}`;
 
-/** 身長(cm)を説明から読む。書いていなければ性別から決める */
+/** 身長(cm)。Euros の heightCm があればそれ、なければ説明から読む。書いていなければ性別から決める */
 export function guessHeight(c: EurosCharacter, male: boolean): number {
+  if (typeof c.heightCm === "number" && c.heightCm >= 80 && c.heightCm <= 250) return c.heightCm;
   const m = ja(c, "height").match(/(1\d{2}|2[0-4]\d)(?:\.\d)?\s*(?:cm|センチ)/i);
   return m ? Number(m[1]) : male ? 170 : 155;
 }
@@ -228,13 +287,84 @@ export function personFrom(c: EurosCharacter, color: number): ScenePerson {
   };
 }
 
+/** 外見の説明(日本語と英語をすべて)。形の種類の推定に使う */
+export const describe = (c: EurosCharacter) =>
+  [c.profile?.name, ...Object.values(c.appearance ?? {}).flatMap((t) => [t?.ja, t?.en])].filter(Boolean).join(" ");
+
+/** Euros の人ではない登場人物から、場面に置く登場人物を作る。body がなければ説明から形の種類を推定する */
+export function creatureFrom(c: EurosCharacter, color: number): SceneCreature {
+  const body = parseBody(c.body);
+  return {
+    characterId: c.id,
+    revisionId: currentSheet(c)?.revisionId ?? null,
+    name: c.profile?.name || "(名前なし)",
+    body: body ?? defaultBody(guessForm(describe(c))),
+    bodyFrom: body ? "euros" : "guess",
+    x: 0,
+    z: 0.9,
+    rotation: 180,
+    color,
+    lift: 0,
+    tilt: 0,
+    roll: 0,
+    squash: 0,
+    dent: null,
+    joints: { ...DEFAULT_JOINTS },
+    action: emptyText(),
+  };
+}
+
+/** 形の種類を変えたときの体。大きさの項目は、同じ名前の項目だけ引き継ぐ */
+export function changeForm(body: CreatureBody, form: CreatureBody["form"]): CreatureBody {
+  const d = defaultBody(form);
+  return { ...body, form, size: Object.fromEntries(Object.entries(d.size).map(([k, v]) => [k, body.size[k] ?? v])) };
+}
+
+// ---------------------------------------------------------------- 清書に渡す画像
+
+/** Picture 2 以降に渡す画像:人物のシート(人物の順)→ 人ではない登場人物のシート → 装備品のデザイン */
+export type Reference =
+  | { kind: "character"; characterId: string; revisionId: string; image: string }
+  | { kind: "equipment"; equipmentId: string; revisionId: string | null; image: string };
+
+export interface References {
+  /** 渡す画像の順(シートがない登場人物は null) */
+  list: (Reference | null)[];
+  /** 登場人物と装備品が、何番目の画像か(Picture n の n) */
+  person: number[];
+  creature: number[];
+  equipment: Record<string, number>;
+}
+
+export function referencesOf(scene: Scene, characters: Record<string, EurosCharacter>, equipment: Record<string, EurosEquipment> = {}): References {
+  const list: (Reference | null)[] = [];
+  const sheetOf = (characterId: string): Reference | null => {
+    const c = characters[characterId];
+    const sh = c ? currentSheet(c) : null;
+    return sh ? { kind: "character", characterId, ...sh } : null;
+  };
+  // Picture 1 は下絵なので、list の n 番目(0 から)は Picture n + 2
+  const person = scene.people.map((p) => list.push(sheetOf(p.characterId)) + 1);
+  const creature = (scene.creatures ?? []).map((c) => list.push(sheetOf(c.characterId)) + 1);
+  const eq: Record<string, number> = {};
+  for (const pr of scene.props) {
+    const e = pr.equipment && equipment[pr.equipment.id];
+    const im = e && equipmentImage(e);
+    if (!e || !im || eq[e.id]) continue;
+    eq[e.id] = list.push({ kind: "equipment", equipmentId: e.id, ...im }) + 1;
+  }
+  return { list, person, creature, equipment: eq };
+}
+
 // ---------------------------------------------------------------- 清書のプロンプト
 
 const LOOK_KEYS = ["hair", "eyes", "face", "skin", "body", "outfit", "accessories", "equipment"];
 
-/** 外見の英語をつなげる(Picture 2 のシートと同じ見た目を言葉でも伝える) */
+/** 外見の英語をつなげる(Picture 2 のシートと同じ見た目を言葉でも伝える)。人ではない登場人物は、項目を決めずにすべて */
 export function lookOf(c: EurosCharacter): string {
-  return LOOK_KEYS.map((k) => clean(c.appearance?.[k]?.en))
+  const keys = isNotHuman(c) ? Object.keys(c.appearance ?? {}).filter((k) => k !== "height") : LOOK_KEYS;
+  return keys
+    .map((k) => clean(c.appearance?.[k]?.en))
     .filter(Boolean)
     .join("; ");
 }
@@ -249,6 +379,30 @@ const sideEn = (side: "l" | "r") => (side === "l" ? "left" : "right");
 
 /** 人物を指す言葉(「the RED character」) */
 const who = (people: ScenePerson[], i: number) => (people[i] ? `the ${colorOf(people[i])} character` : "someone");
+const creatureColor = (c: SceneCreature) => PERSON_COLORS[c.color % PERSON_COLORS.length].en;
+const whoCreature = (creatures: SceneCreature[], i: number) => (creatures[i] ? `the ${creatureColor(creatures[i])} creature` : "the creature");
+
+const cm = (m: number) => `${Math.round(m * 100)} cm`;
+
+/** 人ではない登場人物の形と大きさの英語(誇張したら、そう伝える) */
+function creatureShapeEn(c: SceneCreature): string {
+  const size = exaggeratedSize(c.body, c.scale);
+  const dims = Object.keys(CREATURE_FORMS[c.body.form].size).map(
+    (k) => `${cm(size[k] ?? 0)} ${c.body.form === "quadruped" && k === "height" ? "tall at the shoulder" : (SIZE_LABELS[k]?.en ?? k)}`,
+  );
+  const extra: string[] = [];
+  if (c.body.form === "sphere" && c.lift >= 0.05) extra.push(`floating about ${cm(c.lift)} above the ground`);
+  if (c.body.form === "blob" && c.squash >= 0.15) extra.push("squashed flat");
+  if (c.body.form === "blob" && c.squash <= -0.15) extra.push("stretched tall");
+  if (c.body.form === "blob" && c.dent && c.dent.depth > 0) extra.push(`dented in at its ${CREATURE_PARTS[c.dent.part].en}`);
+  if (c.body.form === "quadruped" || c.body.form === "biped") {
+    const stance = STANCES.find((x) => x.id === c.joints.stance);
+    if (stance && stance.id !== "stand") extra.push(stance.en);
+    if (c.joints.mouth >= 0.3) extra.push("mouth open");
+  }
+  const text = `Its body is ${CREATURE_FORMS[c.body.form].en}, about ${dims.join(", ")}${extra.length ? `, ${extra.join(", ")}` : ""}.`;
+  return isExaggerated(c.scale) ? `${text} It is deliberately drawn larger than its real size for emphasis; keep exactly this size.` : text;
+}
 
 const HAND_EN: Record<string, string> = { fist: "clenched in a fist", point: "pointing with the index finger", peace: "making a peace sign", open: "open" };
 
@@ -256,10 +410,13 @@ const HAND_EN: Record<string, string> = { fist: "clenched in a fist", point: "po
  * 清書のプロンプト。検証で効いた形(設計書 5.7):
  * Picture 1 = 下絵は位置・ポーズ・向き・カメラだけに使い、素体の体や色は描かない。Picture 2〜 = 人物のシート(色の順)
  */
-export function buildPrompt(scene: Scene, characters: Record<string, EurosCharacter>): string {
+export function buildPrompt(scene: Scene, characters: Record<string, EurosCharacter>, equipment: Record<string, EurosEquipment> = {}): string {
   const { people, props, contacts } = scene;
+  const creatures = scene.creatures ?? [];
+  const refs = referencesOf(scene, characters, equipment);
   const seat = people.some((p) => POSES.find((d) => d.id === p.pose)?.seat);
-  const count = people.length === 1 ? "one character" : `${people.length} characters`;
+  const total = people.length + creatures.length;
+  const count = total === 1 ? "one character" : `${total} characters`;
   const avoid = ["the figures", "their bare bodies", "the colors of the figures and objects", "the gray floor disc"];
   const lines = [
     `Redraw <Picture 1> as a finished, high-quality anime-style light novel ${scene.frame === "cover" ? "cover illustration" : "illustration"} with ${count}.`,
@@ -268,7 +425,7 @@ export function buildPrompt(scene: Scene, characters: Record<string, EurosCharac
   people.forEach((p, i) => {
     const c = characters[p.characterId];
     const parts = [
-      `- The ${colorOf(p)} figure is ${c?.profile?.name ? `${c.profile.name}, ` : ""}the character from the character sheet <Picture ${i + 2}>${c && lookOf(c) ? `: ${lookOf(c)}` : ""}.`,
+      `- The ${colorOf(p)} figure is ${c?.profile?.name ? `${c.profile.name}, ` : ""}the character from the character sheet <Picture ${refs.person[i]}>${c && lookOf(c) ? `: ${lookOf(c)}` : ""}.`,
       `Pose: ${poseEn(p.pose)}${clean(p.action.en) ? `, ${clean(p.action.en)}` : ""}.`,
     ];
     const hands = (["l", "r"] as const).filter((side) => HAND_EN[p.hands?.[side] ?? ""]).map((side) => `${sideEn(side)} hand ${HAND_EN[p.hands![side]]}`);
@@ -276,19 +433,35 @@ export function buildPrompt(scene: Scene, characters: Record<string, EurosCharac
     const gaze = p.gaze;
     if (gaze?.kind === "camera") parts.push("Looking at the viewer.");
     if (gaze?.kind === "person" && gaze.index !== i && people[gaze.index]) parts.push(`Looking at ${who(people, gaze.index)}.`);
+    if (gaze?.kind === "creature" && creatures[gaze.index]) parts.push(`Looking at ${whoCreature(creatures, gaze.index)}.`);
     if (clean(p.expression.en)) parts.push(`Expression: ${clean(p.expression.en)}.`);
+    lines.push(parts.join(" "));
+  });
+  creatures.forEach((cr, i) => {
+    const c = characters[cr.characterId];
+    const color = creatureColor(cr);
+    const parts = [
+      `- The ${color} shape (the ${color} creature) is ${c?.profile?.name ? `${c.profile.name}, ` : ""}the non-human character from the character sheet <Picture ${refs.creature[i]}>${c && lookOf(c) ? `: ${lookOf(c)}` : ""}.`,
+      creatureShapeEn(cr),
+    ];
+    if (clean(cr.action.en)) parts.push(`Action: ${clean(cr.action.en)}.`);
+    parts.push(`Draw it as it looks on its sheet, at exactly the size, shape and position shown in <Picture 1>, keeping its size relative to the other characters; do not draw it as a plain ${color.toLowerCase()} shape.`);
     lines.push(parts.join(" "));
   });
   props.forEach((pr) => {
     const color = PROP_COLORS[pr.color % PROP_COLORS.length].en;
     const what = clean(pr.name.en) || `a ${PROP_KINDS[pr.kind].en}`;
-    const k = pr.scale ?? { all: 1, length: 1, width: 1 };
+    const k = pr.scale ?? NO_EXAGGERATION;
     const size = PROP_KINDS[pr.kind].long ? `about ${Math.round(pr.lengthCm * k.all * k.length)} cm long` : `about ${Math.round(pr.lengthCm * k.all)} cm`;
     const where = pr.holder && people[pr.holder.person] ? `, held in ${who(people, pr.holder.person)}'s ${sideEn(pr.holder.side)} hand` : ", on the ground";
-    lines.push(`- The ${color} object is ${what} (${size})${where}. Draw it at exactly the size and position shown in <Picture 1>.`);
+    const picture = pr.equipment && refs.equipment[pr.equipment.id] ? `, the item shown in <Picture ${refs.equipment[pr.equipment.id]}>` : "";
+    const big = isExaggerated(pr.scale) ? " It is deliberately drawn larger than its real size for emphasis; keep exactly this size, do not shrink it to a realistic size." : "";
+    lines.push(`- The ${color} object is ${what}${picture} (${size})${where}. Draw it at exactly the size and position shown in <Picture 1>.${big}`);
   });
   contacts.forEach((c) => {
-    const target = `${who(people, c.to.person)}'s ${BODY_PARTS[c.to.part].en}`;
+    const target = isCreatureTarget(c.to)
+      ? `${whoCreature(creatures, c.to.creature)}'s ${CREATURE_PARTS[c.to.part].en}`
+      : `${who(people, c.to.person)}'s ${BODY_PARTS[c.to.part].en}`;
     const from =
       c.from.kind === "hand"
         ? `${who(people, c.from.person)}'s ${sideEn(c.from.side)} hand`
@@ -296,12 +469,15 @@ export function buildPrompt(scene: Scene, characters: Record<string, EurosCharac
     lines.push(`- Contact: ${from} must clearly touch ${target}, exactly where they meet in <Picture 1>; no gap between them.`);
   });
   lines.push(
-    people.length > 1
+    total > 1
       ? "Each character must look exactly like their own sheet; do not mix their hair, faces or clothes."
-      : "The character must look exactly like the sheet: same hair, face, eyes, outfit and accessories.",
+      : creatures.length
+        ? "The character must look exactly like the sheet."
+        : "The character must look exactly like the sheet: same hair, face, eyes, outfit and accessories.",
   );
-  const styles = [...new Set(people.map((p) => clean(characters[p.characterId]?.style)).filter(Boolean))];
-  const sheets = people.map((_, i) => `<Picture ${i + 2}>`).join(" and ");
+  const ids = [...people.map((p) => p.characterId), ...creatures.map((c) => c.characterId)];
+  const styles = [...new Set(ids.map((id) => clean(characters[id]?.style)).filter(Boolean))];
+  const sheets = [...refs.person, ...refs.creature].map((n) => `<Picture ${n}>`).join(" and ");
   lines.push(`Match the art style of ${sheets}${styles.length ? `: ${styles.join("; ")}` : ""}.`);
   lines.push(`${clean(scene.background.en) ? `Background: ${clean(scene.background.en)}. ` : ""}Full color, no text, no logo.`);
   return lines.join("\n");

@@ -2,13 +2,14 @@ import * as THREE from "three";
 import { BODY_PARTS, type BodyPart, Figure, type FigureId, type HandShape, LIMBS, type LimbId, PERSON_COLORS } from "./figures";
 import { type PoseId, POSES } from "./poses";
 import { dirFromAngles, PROP_COLORS, PROP_KINDS, type PropShape, propMesh } from "./props";
+import { type BuiltCreature, buildCreature, type CreaturePart, type Exaggeration, NO_EXAGGERATION, type StageCreature } from "./creatures";
 
 /** 場面の 3D 表示。下絵(清書に渡す画像)もここで撮る */
 
 /** 人物から見た位置(m)。+Z が前、+X が人物の左、+Y が上 */
 export type Vec3 = [number, number, number];
 
-export type Gaze = { kind: "manual" } | { kind: "camera" } | { kind: "person"; index: number };
+export type Gaze = { kind: "manual" } | { kind: "camera" } | { kind: "person"; index: number } | { kind: "creature"; index: number };
 
 export interface StagePerson {
   figure: FigureId;
@@ -43,19 +44,26 @@ export interface StageProp extends PropShape {
   /** 向き(度)。持つときは人物から見た向き、置くときは場面の向き */
   yaw: number;
   pitch: number;
-  /** 誇張(場面だけで大きさを変える倍率。M3 で使う) */
-  scale?: { all: number; length: number; width: number };
+  /** 誇張(場面だけで大きさを変える倍率。長さ・太さ)。小物の寸法そのものは変えない */
+  scale?: Exaggeration;
 }
 
 export type ContactFrom = { kind: "hand"; person: number; side: "l" | "r" } | { kind: "prop"; prop: number };
 
+/** 触れられる側:人物の部位か、人ではない登場人物の部位 */
+export type ContactTo = { person: number; part: BodyPart } | { creature: number; part: CreaturePart };
+
+export const isCreatureTarget = (t: ContactTo): t is { creature: number; part: CreaturePart } => "creature" in t;
+
 export interface StageContact {
   from: ContactFrom;
-  to: { person: number; part: BodyPart };
+  to: ContactTo;
 }
 
 export interface StageState {
   people: StagePerson[];
+  /** 人ではない登場人物 */
+  creatures?: StageCreature[];
   props: StageProp[];
   contacts: StageContact[];
 }
@@ -79,7 +87,7 @@ export interface StageCamera {
 export const DEFAULT_CAMERA: StageCamera = { yaw: 0, pitch: 4, distance: 4.2, targetY: 0.85, fov: 35, targetX: 0, targetZ: 0 };
 
 /** クリックした物 */
-export type Pick = { kind: "handle"; person: number; limb: LimbId } | { kind: "person"; person: number } | null;
+export type Pick = { kind: "handle"; person: number; limb: LimbId } | { kind: "person"; person: number } | { kind: "creature"; creature: number } | null;
 
 const BG = 0xffffff;
 /** 触れる点の印の色(編集の画面にだけ出す) */
@@ -93,6 +101,9 @@ export class Stage {
   private figureKey = "";
   /** 状態が変わるたびに作り直す物(椅子・小物・印・つかむ点) */
   private extras = new THREE.Group();
+  /** 人ではない登場人物(状態が変わるたびに作り直す) */
+  private creatures = new THREE.Group();
+  private built: BuiltCreature[] = [];
   private handles = new THREE.Group();
   private loading = 0;
   private aspect = 1;
@@ -111,7 +122,7 @@ export class Stage {
     // 床の目安(清書では描かない。立ち位置と大きさの手がかり)
     const ground = new THREE.Mesh(new THREE.CircleGeometry(3, 64), new THREE.MeshStandardMaterial({ color: 0xeeeeee }));
     ground.rotation.x = -Math.PI / 2;
-    this.scene.add(ground, this.extras, this.handles);
+    this.scene.add(ground, this.extras, this.creatures, this.handles);
   }
 
   /** 表示する大きさ(px)と、枠の縦横比 */
@@ -137,12 +148,18 @@ export class Stage {
     this.apply();
   }
 
-  /** ポーズ → つかんだ手足 → 触れる点 → 視線 → 小物 の順に決める */
+  /** ポーズ → 人ではない登場人物 → つかんだ手足 → 触れる点 → 視線 → 小物 の順に決める */
   private apply() {
     const { people, props, contacts } = this.state;
     if (this.figures.length !== people.length) return;
     this.clear(this.extras);
     this.clear(this.handles);
+    this.clear(this.creatures);
+    this.built = (this.state.creatures ?? []).map((c) => {
+      const b = buildCreature(c, PERSON_COLORS[c.color % PERSON_COLORS.length].hex);
+      this.creatures.add(b.root);
+      return b;
+    });
 
     people.forEach((p, i) => {
       const f = this.figures[i];
@@ -199,7 +216,8 @@ export class Stage {
       const f = this.figures[i];
       const gaze = p.gaze ?? { kind: "manual" };
       if (gaze.kind === "manual") return f.turnHead(p.headYaw, p.headPitch);
-      const target = gaze.kind === "camera" ? this.camera.position.clone() : this.figures[gaze.index]?.bonePosition("head");
+      const target =
+        gaze.kind === "camera" ? this.camera.position.clone() : gaze.kind === "creature" ? this.built[gaze.index]?.look.clone() : this.figures[gaze.index]?.bonePosition("head");
       if (!target || (gaze.kind === "person" && gaze.index === i)) return f.turnHead(p.headYaw, p.headPitch);
       const a = f.gazeAngles(target);
       f.turnHead(a.yaw, a.pitch);
@@ -244,7 +262,7 @@ export class Stage {
 
   /** 誇張の倍率を掛けた寸法 */
   private scaled(p: StageProp): StageProp {
-    const s = p.scale ?? { all: 1, length: 1, width: 1 };
+    const s = p.scale ?? NO_EXAGGERATION;
     return { ...p, lengthCm: p.lengthCm * s.all * s.length, widthCm: p.widthCm * s.all * s.width, heightCm: p.heightCm * s.all };
   }
 
@@ -254,6 +272,11 @@ export class Stage {
 
   /** 触れる点の位置。体の中の骨から、触れる側に少し出す(体の表面のあたり) */
   private contactPoint(c: StageContact): THREE.Vector3 | null {
+    // 人ではない登場人物は、部位の位置が表面(へこみがあれば、へこみの底)
+    if (isCreatureTarget(c.to)) {
+      const b = this.built[c.to.creature];
+      return b ? (b.points[c.to.part] ?? b.look).clone() : null;
+    }
     const f = this.figures[c.to.person];
     if (!f) return null;
     const p = f.bonePosition(BODY_PARTS[c.to.part].bone);
@@ -312,7 +335,15 @@ export class Stage {
       const hit = this.raycaster.intersectObjects(f.meshes, false)[0];
       if (hit && (!best || hit.distance < best.distance)) best = { person: i, distance: hit.distance };
     });
-    return best ? { kind: "person", person: (best as { person: number }).person } : null;
+    let creature: { index: number; distance: number } | null = null;
+    this.built.forEach((b, i) => {
+      const hit = this.raycaster.intersectObjects(b.meshes, false)[0];
+      if (hit && (!creature || hit.distance < creature.distance)) creature = { index: i, distance: hit.distance };
+    });
+    const p = best as { person: number; distance: number } | null;
+    const c = creature as { index: number; distance: number } | null;
+    if (c && (!p || c.distance < p.distance)) return { kind: "creature", creature: c.index };
+    return p ? { kind: "person", person: p.person } : null;
   }
 
   /** 画面の位置と床(y = 0)の交点 */
@@ -369,6 +400,7 @@ export class Stage {
     this.figures.forEach((f) => f.dispose());
     this.clear(this.extras);
     this.clear(this.handles);
+    this.clear(this.creatures);
     this.renderer.dispose();
   }
 }

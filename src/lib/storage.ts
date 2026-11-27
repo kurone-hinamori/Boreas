@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { CharacterSummary, Entry, Folders, Settings } from "../types";
 import { DEFAULT_SETTINGS } from "../types";
 import type { EurosCharacter, Scene } from "./scene";
+import type { EurosEquipment } from "./props";
 
 /** アプリのデータフォルダーの settings.json から読む */
 export async function loadSettings(): Promise<Settings> {
@@ -36,6 +37,11 @@ export async function eurosFileUrl(id: string, file: string): Promise<string> {
 export const loadEurosCharacter = (id: string) => invoke<EurosCharacter>("load_euros_character", { id });
 /** Euros のキャラクターの画像(シートなど)の中身 */
 export const eurosFileBytes = async (id: string, file: string) => new Uint8Array(await invoke<ArrayBuffer>("load_euros_file", { id, file }));
+
+/** Euros の装備品(読むだけ) */
+export const listEurosEquipment = () => invoke<EurosEquipment[]>("list_euros_equipment");
+/** 装備品の画像(デザイン)の中身 */
+export const equipmentFileBytes = async (id: string, file: string) => new Uint8Array(await invoke<ArrayBuffer>("load_euros_equipment_file", { id, file }));
 
 export const listSceneData = () => invoke<Scene[]>("list_scenes");
 export const loadScene = (id: string) => invoke<Scene>("load_scene", { id });

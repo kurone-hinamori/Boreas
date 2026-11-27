@@ -1,5 +1,6 @@
 import { fetch } from "@tauri-apps/plugin-http";
 import type { Settings } from "../types";
+import { CREATURE_FORMS, type CreatureBody, parseBody } from "./creatures";
 
 type Conn = Pick<Settings, "ollamaUrl" | "model">;
 
@@ -73,4 +74,29 @@ export async function translateFields<K extends string>(s: Conn, fields: Record<
   const start = text.indexOf("{");
   const parsed = JSON.parse(start >= 0 ? text.slice(start, text.lastIndexOf("}") + 1) : text) as Partial<Record<K, unknown>>;
   return Object.fromEntries(keys.map((k) => [k, typeof parsed[k] === "string" ? (parsed[k] as string).trim() : ""])) as Record<K, string>;
+}
+
+const BODY_SYSTEM = `You read the description of a non-human character for an illustration and estimate its body shape and real size.
+form is one of: "sphere" (a ball, drone, orb), "blob" (slime, jelly, amorphous mass), "quadruped" (four-legged animal or beast), "biped" (large two-legged monster), "object" (machine, statue, anything rigid).
+Sizes are in meters. sphere: diameter. blob: width, depth, height. quadruped: length (nose to tail base), height (at the shoulder). biped: height, width (shoulder width). object: width, depth, height.
+Use the sizes written in the description if any; otherwise estimate a typical size. Set sizes that do not apply to the form to 0.`;
+
+/** 人ではない登場人物の説明から、形の種類と大きさ(m)の案を作る(設計書 5.6) */
+export async function estimateBody(s: Conn, description: string): Promise<CreatureBody> {
+  const keys = ["diameter", "width", "depth", "height", "length"];
+  const schema = {
+    type: "object",
+    properties: {
+      form: { type: "string", enum: Object.keys(CREATURE_FORMS) },
+      size: { type: "object", properties: Object.fromEntries(keys.map((k) => [k, { type: "number" }])), required: keys },
+      arms: { type: "boolean" },
+      tail: { type: "boolean" },
+    },
+    required: ["form", "size", "arms", "tail"],
+  };
+  const text = await chat(s, BODY_SYSTEM, description, schema);
+  const start = text.indexOf("{");
+  const body = parseBody(JSON.parse(start >= 0 ? text.slice(start, text.lastIndexOf("}") + 1) : text));
+  if (!body) throw new Error("形の種類を読み取れませんでした");
+  return body;
 }

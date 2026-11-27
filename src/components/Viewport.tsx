@@ -16,6 +16,9 @@ interface Props {
   onCamera: (c: StageCamera) => void;
   onSelect: (person: number | null) => void;
   onMovePerson: (person: number, x: number, z: number) => void;
+  /** 人ではない登場人物を選ぶ・動かす */
+  onSelectCreature: (creature: number) => void;
+  onMoveCreature: (creature: number, x: number, z: number) => void;
   onLimb: (person: number, limb: LimbId, pos: Vec3) => void;
 }
 
@@ -24,7 +27,7 @@ const round = (v: number, step = 0.01) => Math.round(v / step) * step;
 
 /**
  * 場面の 3D 表示。
- * 人物をクリックで選び、ドラッグで床の上を動かす。選んだ人物の黒い点(手足の先)をドラッグで動かす。
+ * 人物・人ではない登場人物をクリックで選び、ドラッグで床の上を動かす。選んだ人物の黒い点(手足の先)をドラッグで動かす。
  * 何もない所のドラッグでカメラを回す(Shift で高さ、Ctrl で平行に動かす)。ホイールで近づける
  */
 export const Viewport = forwardRef<ViewportHandle, Props>(function Viewport(props, ref) {
@@ -102,9 +105,10 @@ export const Viewport = forwardRef<ViewportHandle, Props>(function Viewport(prop
     let moved = false;
     // 人物を動かすときは、つかんだ位置と立ち位置のずれを保つ
     let offset: [number, number] = [0, 0];
-    if (hit?.kind === "person") {
-      latest.current.onSelect(hit.person);
-      const p = latest.current.state.people[hit.person];
+    if (hit?.kind === "person" || hit?.kind === "creature") {
+      const p = hit.kind === "person" ? latest.current.state.people[hit.person] : latest.current.state.creatures?.[hit.creature];
+      if (hit.kind === "person") latest.current.onSelect(hit.person);
+      else latest.current.onSelectCreature(hit.creature);
       const f = s.floorPoint(nx, ny);
       if (f && p) offset = [p.x - f.x, p.z - f.z];
     }
@@ -123,6 +127,9 @@ export const Viewport = forwardRef<ViewportHandle, Props>(function Viewport(prop
       } else if (hit?.kind === "person") {
         const f = s.floorPoint(mx, my);
         if (f) latest.current.onMovePerson(hit.person, round(f.x + offset[0]), round(f.z + offset[1]));
+      } else if (hit?.kind === "creature") {
+        const f = s.floorPoint(mx, my);
+        if (f) latest.current.onMoveCreature(hit.creature, round(f.x + offset[0]), round(f.z + offset[1]));
       } else if (ev.shiftKey) {
         latest.current.onCamera({ ...c, targetY: round(clamp(c.targetY + dy * 0.005, -0.5, 3)) });
       } else if (ev.ctrlKey) {

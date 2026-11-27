@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /><title>人ではない登場人物の確認</title>
+<style>body{margin:0;font:12px sans-serif}#grid{display:flex;flex-wrap:wrap;gap:4px}figure{margin:0;text-align:center}img{width:240px;border:1px solid #ccc}pre{white-space:pre-wrap;font-size:11px;max-width:1000px}</style></head>
+<body>
+<!--
+  開発用:人ではない登場人物の形と、確かめる場面(鈴がバットをスライムに振り下ろす)の下絵を並べる。
+  npm run dev で http://localhost:1430/dev/creatures.html を開く。
+  ?sketch=1 で場面の下絵だけを清書と同じ大きさで撮り、<img id="sketch"> と <pre id="prompt"> に出す
+-->
+<canvas id="c" width="640" height="480" style="display:none"></canvas>
+<div id="grid"></div>
+<pre id="prompt"></pre>
+<script type="module">
+import { Stage, DEFAULT_CAMERA } from "/src/lib/stage.ts";
+import { CREATURE_FORMS, DEFAULT_JOINTS, defaultBody } from "/src/lib/creatures.ts";
+import { buildPrompt, newScene, sketchSize } from "/src/lib/scene.ts";
+const q = new URLSearchParams(location.search);
+const stage = new Stage(document.getElementById("c"));
+const grid = document.getElementById("grid");
+const show = (png, label, width) => {
+  const fig = document.createElement("figure");
+  fig.innerHTML = `<img src="${URL.createObjectURL(new Blob([png], { type: "image/png" }))}" style="width:${width ?? 240}px"><figcaption>${label}</figcaption>`;
+  grid.append(fig);
+  return fig.querySelector("img");
+};
+
+const creature = (body, patch = {}) => ({ body, x: 0, z: 0.9, rotation: 180, color: 2, lift: 0, tilt: 0, roll: 0, squash: 0, dent: null, joints: { ...DEFAULT_JOINTS }, ...patch });
+const suzu = { figure: "female_slim", heightCm: 150, x: 0, z: 0, rotation: 0, pose: "stand", headYaw: 0, headPitch: 0, color: 0, hands: { l: "auto", r: "auto" }, ik: {}, gaze: { kind: "manual" } };
+
+// 確かめる場面:身長 150cm の鈴が、実寸のバット(84cm)を、幅 160cm のスライムの頭に振り下ろす。バットの先はスライムのへこみの底に届く
+const slimeScene = (scale) => {
+  const s = newScene("鈴がバットをスライムに振り下ろす");
+  s.frame = "landscape";
+  s.people = [{ ...suzu, characterId: "suzu", revisionId: null, name: "天音 鈴", pose: "swing_down", gaze: { kind: "creature", index: 0 }, action: { ja: "", en: "" }, expression: { ja: "", en: "" } }];
+  s.creatures = [{ ...creature({ form: "blob", size: { width: 1.6, depth: 1.4, height: 0.9 } }, { z: 1.0, dent: { part: "top", depth: 0.2 }, scale }), characterId: "slime", revisionId: null, name: "スライム", bodyFrom: "euros", action: { ja: "", en: "" } }];
+  s.props = [{ id: "bat", kind: "bat", lengthCm: 84, widthCm: 6.6, heightCm: 0, grip: 0.12, color: 0, holder: { person: 0, side: "r" }, x: 0, z: 0, yaw: 0, pitch: 0, name: { ja: "", en: "a silver metal baseball bat" } }];
+  s.contacts = [{ id: "c", from: { kind: "prop", prop: 0 }, to: { creature: 0, part: "top" } }];
+  s.camera = { ...DEFAULT_CAMERA, yaw: 75, pitch: 8, distance: 4.4, targetY: 0.7, targetX: 0, targetZ: 0.6, fov: 35 };
+  return s;
+};
+
+if (q.get("sketch")) {
+  const scale = q.get("scale") ? { all: Number(q.get("scale")), length: 1, width: 1 } : undefined;
+  const s = slimeScene(scale);
+  const [w, h] = sketchSize(s.frame);
+  stage.resize(w, h);
+  stage.setCamera(s.camera);
+  await stage.setState(s, null);
+  stage.setCamera(s.camera);
+  const img = show(await stage.capture(w, h), "下絵", w);
+  img.id = "sketch";
+  const characters = {
+    suzu: { id: "suzu", profile: { name: "天音 鈴" } },
+    slime: { id: "slime", profile: { name: "スライム" }, sheet: { notHuman: true } },
+  };
+  document.getElementById("prompt").textContent = buildPrompt(s, characters);
+} else {
+  stage.resize(480, 360);
+  const cam = { ...DEFAULT_CAMERA, yaw: 40, pitch: 12, distance: 5.2, targetY: 0.9, targetZ: 0.5 };
+  stage.setCamera(cam);
+  const forms = Object.keys(CREATURE_FORMS);
+  const variants = [
+    ...forms.map((f) => [CREATURE_FORMS[f].label, creature(defaultBody(f))]),
+    ["球:浮く・傾く", creature(defaultBody("sphere"), { lift: 1.2, tilt: 20 })],
+    ["不定形:つぶれ・上のへこみ", creature(defaultBody("blob"), { squash: 0.4, dent: { part: "top", depth: 0.3 } })],
+    ["四足:飛びかかる・口を開く", creature(defaultBody("quadruped"), { joints: { ...DEFAULT_JOINTS, stance: "leap", mouth: 1, tail: 40 } })],
+    ["二足:身を低く・腕を上げる", creature(defaultBody("biped"), { joints: { ...DEFAULT_JOINTS, stance: "crouch", armL: 120, armR: 160, lean: 20, mouth: 0.8 } })],
+    ["不定形:誇張 ×1.5", creature(defaultBody("blob"), { scale: { all: 1.5, length: 1, width: 1 } })],
+  ];
+  for (const [label, c] of variants) {
+    await stage.setState({ people: [suzu], creatures: [c], props: [], contacts: [] }, null);
+    stage.setCamera(cam);
+    show(await stage.capture(480, 360), label);
+  }
+  for (const scale of [undefined, { all: 1.5, length: 1, width: 1 }]) {
+    const s = slimeScene(scale);
+    stage.resize(640, 448);
+    await stage.setState(s, null);
+    stage.setCamera(s.camera);
+    show(await stage.capture(640, 448), scale ? "場面(スライム ×1.5)" : "場面(実寸)", 480);
+  }
+}
+window.done = true;
+</script>
+</body>
+</html>

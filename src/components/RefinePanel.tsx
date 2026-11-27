@@ -4,15 +4,19 @@ import type { Settings } from "../types";
 import { detectModels, progressText, refine, uploadImage } from "../lib/comfy";
 import { unloadModel, translateFields } from "../lib/ollama";
 import { useLeaveGuard } from "../lib/leaveGuard";
-import { buildPrompt, currentSheet, type EurosCharacter, FRAMES, newId, type Scene, sketchSize, type Take, type Text } from "../lib/scene";
-import { deleteSceneFile, eurosFileBytes, exportSceneFile, saveSceneFile, sceneFileUrl } from "../lib/storage";
+import { buildPrompt, type EurosCharacter, FRAMES, newId, referencesOf, type Scene, sketchSize, type Take, type Text } from "../lib/scene";
+import type { EurosEquipment } from "../lib/props";
+import { deleteSceneFile, equipmentFileBytes, eurosFileBytes, exportSceneFile, saveSceneFile, sceneFileUrl } from "../lib/storage";
 import type { ViewportHandle } from "./Viewport";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+/** 画像の拡張子(ComfyUI に送る名前に使う) */
+const ext = (file: string) => file.split(".").pop()?.toLowerCase() || "png";
 
 interface Props {
   scene: Scene;
   characters: Record<string, EurosCharacter>;
+  equipment: Record<string, EurosEquipment>;
   settings: Settings;
   viewport: RefObject<ViewportHandle | null>;
   change: (fn: (s: Scene) => Scene, immediate?: boolean) => void;
@@ -41,7 +45,7 @@ function SceneImage({ sceneId, file, onClick }: { sceneId: string; file: string;
 }
 
 /** 清書:下絵を撮り、シートと一緒に ComfyUI(MiniMax-H3-Image)に渡して候補を作る */
-export function RefinePanel({ scene, characters, settings, viewport, change, flush }: Props) {
+export function RefinePanel({ scene, characters, equipment, settings, viewport, change, flush }: Props) {
   const [count, setCount] = useState(2);
   const [status, setStatus] = useState<{ running: boolean; text: string; error?: string }>({ running: false, text: "" });
   const [translating, setTranslating] = useState(false);
@@ -50,20 +54,19 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
   useLeaveGuard(status.running ? "清書の途中です。画面を離れると中断します。" : null);
   useEffect(() => () => abort.current?.abort(), []);
 
-  // Picture 2 以降に渡すシート(人物の順)
-  const sheets = scene.people.map((p) => {
-    const c = characters[p.characterId];
-    const sh = c ? currentSheet(c) : null;
-    return c && sh ? { character: c, ...sh } : null;
-  });
-  const noSheet = scene.people.filter((_, i) => !sheets[i]).map((p) => p.name);
-  const prompt = buildPrompt(scene, characters);
+  // Picture 2 以降に渡す画像(人物のシート → 人ではない登場人物のシート → 装備品のデザイン)
+  const refs = referencesOf(scene, characters, equipment);
+  const sheets = refs.list;
+  const cast = [...scene.people, ...scene.creatures];
+  const noSheet = cast.filter((_, i) => !sheets[i]).map((p) => p.name);
+  const prompt = buildPrompt(scene, characters, equipment);
   // 日本語だけで、英語になっていない項目
   const texts: [string, Text][] = [
     ...scene.people.flatMap((p, i): [string, Text][] => [
       [`p${i}_action`, p.action],
       [`p${i}_expression`, p.expression],
     ]),
+    ...scene.creatures.map((c, i): [string, Text] => [`c${i}_action`, c.action]),
     ...scene.props.map((pr, k): [string, Text] => [`prop${k}`, pr.name]),
     ["background", scene.background],
   ];
@@ -79,6 +82,7 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
         ...s,
         background: pick("background", s.background),
         people: s.people.map((p, i) => ({ ...p, action: pick(`p${i}_action`, p.action), expression: pick(`p${i}_expression`, p.expression) })),
+        creatures: s.creatures.map((c, i) => ({ ...c, action: pick(`c${i}_action`, c.action) })),
         props: s.props.map((pr, k) => ({ ...pr, name: pick(`prop${k}`, pr.name) })),
       }));
     } catch (e) {
@@ -89,7 +93,7 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
   };
 
   const run = async () => {
-    if (!scene.people.length || noSheet.length || !viewport.current) return;
+    if (!cast.length || noSheet.length || !viewport.current) return;
     abort.current?.abort();
     const ctrl = new AbortController();
     abort.current = ctrl;
@@ -110,7 +114,10 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
       await unloadModel(settings);
       say("下絵とシートを ComfyUI に送っています");
       const images = [await uploadImage(settings, `sketch_${scene.id}_${sketchId}.png`, sketchPng)];
-      for (const sh of sheets) images.push(await uploadImage(settings, `sheet_${sh!.character.id}_${sh!.revisionId}.png`, await eurosFileBytes(sh!.character.id, sh!.image)));
+      for (const r of sheets) {
+        if (r?.kind === "character") images.push(await uploadImage(settings, `sheet_${r.characterId}_${r.revisionId}.${ext(r.image)}`, await eurosFileBytes(r.characterId, r.image)));
+        if (r?.kind === "equipment") images.push(await uploadImage(settings, `equipment_${r.equipmentId}_${r.revisionId ?? "x"}.${ext(r.image)}`, await equipmentFileBytes(r.equipmentId, r.image)));
+      }
 
       const { width, height } = FRAMES[scene.frame];
       for (let i = 0; i < count; i++) {
@@ -124,7 +131,7 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
           result: null,
           seed,
           prompt,
-          sheets: sheets.map((sh) => ({ characterId: sh!.character.id, revisionId: sh!.revisionId })),
+          sheets: sheets.map((r) => (r!.kind === "character" ? { characterId: r!.characterId, revisionId: r!.revisionId } : { equipmentId: r!.equipmentId, revisionId: r!.revisionId })),
         };
         const label = count > 1 ? `${i + 1}/${count}枚目:` : "";
         try {
@@ -189,6 +196,12 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
                 </label>
               </div>
             ))}
+            {scene.creatures.map((c, i) => (
+              <label key={`c${i}`} className="field">
+                <span>{c.name}の動作(英語)</span>
+                <input className="en" value={c.action.en} onChange={(e) => change((s) => ({ ...s, creatures: s.creatures.map((x, k) => (k === i ? { ...x, action: { ...x.action, en: e.target.value } } : x)) }))} />
+              </label>
+            ))}
             {scene.props.map((pr, k) => (
               <label key={pr.id} className="field">
                 <span>{pr.name.ja || "小物"}(英語)</span>
@@ -220,12 +233,12 @@ export function RefinePanel({ scene, characters, settings, viewport, change, flu
             {status.running ? (
               <button onClick={() => abort.current?.abort()}>中断</button>
             ) : (
-              <button className="primary" disabled={!scene.people.length || noSheet.length > 0} onClick={() => void run()}>
+              <button className="primary" disabled={!cast.length || noSheet.length > 0} onClick={() => void run()}>
                 清書する
               </button>
             )}
           </div>
-          {!scene.people.length && <p className="muted small-text">人物を置くと清書できます。</p>}
+          {!cast.length && <p className="muted small-text">人物を置くと清書できます。</p>}
           {noSheet.length > 0 && <p className="error small-text">{noSheet.join("・")}には Euros のシートがありません。</p>}
           <p className="muted small-text">1枚に6分ほどかかります。ComfyUI に MiniMax-H3-Image のモデルが必要です。</p>
           {status.running && <p className="status">{status.text}</p>}

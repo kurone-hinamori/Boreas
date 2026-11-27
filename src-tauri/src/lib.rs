@@ -12,6 +12,8 @@ use tauri_plugin_opener::OpenerExt;
 const KINDS: [&str; 2] = ["places", "scenes"];
 /// Euros のキャラクターのフォルダーの中で、読んでよい画像の置き場所と拡張子
 const EUROS_FILE_DIRS: [&str; 2] = ["sheets", "refs"];
+/// Euros の装備品のフォルダーの中で、読んでよい画像の置き場所(デザインの画像)
+const EQUIPMENT_FILE_DIRS: [&str; 4] = ["designs", "sheets", "images", "refs"];
 const FILE_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
 /// 場面のフォルダーの中の画像の置き場所。sketches は下絵、results は清書の候補
 const SCENE_FILE_DIRS: [&str; 2] = ["sketches", "results"];
@@ -300,6 +302,7 @@ fn summarize_character(c: &Value) -> Value {
         "reading": c.pointer("/profile/reading"),
         "updatedAt": c.get("updatedAt"),
         "sheet": sheet,
+        "notHuman": c.pointer("/sheet/notHuman").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
@@ -331,6 +334,15 @@ fn load_euros_character(app: AppHandle, id: String) -> Result<Value, String> {
 
 /// "sheets/xxx.png" のような、キャラクターのフォルダーの中の画像だけを許す
 fn euros_file_path(euros: &Path, id: &str, file: &str) -> Result<PathBuf, String> {
+    euros_entry_file(euros, "characters", &EUROS_FILE_DIRS, id, file)
+}
+
+/// "designs/xxx.png" のような、装備品のフォルダーの中の画像だけを許す
+fn equipment_file_path(euros: &Path, id: &str, file: &str) -> Result<PathBuf, String> {
+    euros_entry_file(euros, "equipment", &EQUIPMENT_FILE_DIRS, id, file)
+}
+
+fn euros_entry_file(euros: &Path, kind: &str, dirs: &[&str], id: &str, file: &str) -> Result<PathBuf, String> {
     if !valid_id(id) {
         return Err("invalid id".into());
     }
@@ -341,15 +353,39 @@ fn euros_file_path(euros: &Path, id: &str, file: &str) -> Result<PathBuf, String
     let Some((stem, ext)) = name.rsplit_once('.') else {
         return Err("invalid file name".into());
     };
-    if !EUROS_FILE_DIRS.contains(&dir) || !valid_id(stem) || !FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+    if !dirs.contains(&dir) || !valid_id(stem) || !FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
         return Err("invalid file path".into());
     }
-    Ok(euros.join("characters").join(id).join(dir).join(name))
+    Ok(euros.join(kind).join(id).join(dir).join(name))
 }
 
 #[tauri::command]
 fn load_euros_file(app: AppHandle, id: String, file: String) -> Result<tauri::ipc::Response, String> {
     let bytes = fs::read(euros_file_path(&euros_library(&app)?, &id, &file)?).map_err(err)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+// ---------------------------------------------------------------- Euros の装備品(読むだけ)
+
+/// equipment/<id>/equipment.json を新しい順に並べる(形式は Euros の docs/character-format.md)
+fn list_equipment_in(euros: &Path) -> Vec<Value> {
+    let mut list: Vec<Value> = list_entries_in(euros, "equipment", "equipment.json")
+        .into_iter()
+        .filter(|e| e.get("app").and_then(Value::as_str) == Some("Euros"))
+        .collect();
+    list.retain(|e| e.get("id").and_then(Value::as_str).is_some_and(valid_id));
+    list
+}
+
+/// 装備品は小さいので、一覧でも中身を丸ごと返す
+#[tauri::command]
+fn list_euros_equipment(app: AppHandle) -> Result<Vec<Value>, String> {
+    Ok(list_equipment_in(&euros_library(&app)?))
+}
+
+#[tauri::command]
+fn load_euros_equipment_file(app: AppHandle, id: String, file: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = fs::read(equipment_file_path(&euros_library(&app)?, &id, &file)?).map_err(err)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -385,7 +421,9 @@ pub fn run() {
             list_places,
             list_euros_characters,
             load_euros_character,
-            load_euros_file
+            load_euros_file,
+            list_euros_equipment,
+            load_euros_equipment_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running Boreas");
@@ -419,6 +457,34 @@ mod tests {
         assert_eq!(ids, [&json!("c2"), &json!("c1")]);
         assert_eq!(list[1]["sheet"], "sheets/r1.png");
         assert_eq!(list[1]["name"], "天音 鈴");
+        assert_eq!(list[1]["notHuman"], false);
+    }
+
+    #[test]
+    fn lists_euros_equipment_and_skips_broken_ones() {
+        let euros = temp("equipment");
+        let put = |id: &str, text: String| {
+            let dir = euros.join("equipment").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("equipment.json"), text).unwrap();
+        };
+        put("bat", json!({ "app": "Euros", "id": "bat", "updatedAt": "2026-01-01", "name": "金属バット", "shape": "bat", "size": { "lengthCm": 84 } }).to_string());
+        put("bad", "{".into());
+        put("other", json!({ "app": "Other", "id": "other" }).to_string());
+        put("evil", json!({ "app": "Euros", "id": "../x" }).to_string());
+        let list = list_equipment_in(&euros);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["size"]["lengthCm"], 84);
+    }
+
+    #[test]
+    fn equipment_file_path_stays_inside_the_equipment() {
+        let euros = Path::new("lib");
+        assert_eq!(equipment_file_path(euros, "bat", "designs/r1.png").unwrap(), euros.join("equipment/bat/designs/r1.png"));
+        assert!(equipment_file_path(euros, "bat", "../c2/designs/r1.png").is_err());
+        assert!(equipment_file_path(euros, "..", "designs/r1.png").is_err());
+        assert!(equipment_file_path(euros, "bat", "equipment.json").is_err());
+        assert!(equipment_file_path(euros, "bat", "designs/r1.exe").is_err());
     }
 
     #[test]
