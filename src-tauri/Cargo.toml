@@ -1,6 +1,6 @@
 [package]
 name = "boreas"
-version = "0.2.0"
+version = "0.3.0"
 description = "Euros のキャラクターと 3D の下絵から、Notos の小説の表紙や挿絵を作るデスクトップアプリ"
 authors = ["kurone-hinamori"]
 edition = "2021"
