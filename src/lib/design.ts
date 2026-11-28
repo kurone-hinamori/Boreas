@@ -1,0 +1,63 @@
+import type { Settings } from "../types";
+import { detectModels, progressText, refine } from "./comfy";
+import { unloadModel } from "./ollama";
+import { type Design, floorBounds, FURNITURE_KINDS, type Furniture, OPENING_KINDS, type Place } from "./place";
+import { savePlaceFile } from "./storage";
+
+// 部屋・家具のデザイン(設計書 5.4)。日本語の説明(英語にしたもの)から、ComfyUI(MiniMax-H3-Image)で絵を作る。キャラクターシートの家具版
+
+const clean = (s: string | undefined) => (s ?? "").trim().replace(/[\s.。]+$/, "");
+
+/** 部屋のデザイン(人物のいない部屋の絵)のプロンプト。清書で背景の参照にする */
+export function roomDesignPrompt(place: Place): string {
+  const [x0, z0, x1, z1] = floorBounds(place.floor);
+  const count = (k: "door" | "window") => place.openings.filter((o) => o.kind === k).length;
+  const openings = (["window", "door"] as const)
+    .filter((k) => count(k))
+    .map((k) => `${count(k)} ${OPENING_KINDS[k].en}${count(k) > 1 ? "s" : ""}`)
+    .join(" and ");
+  const furniture = place.furniture.map((f) => clean(f.name.en) || `a ${FURNITURE_KINDS[f.kind].en}`);
+  return [
+    `Background art of an empty room with no people, for an anime-style light novel illustration${clean(place.description.en) ? `: ${clean(place.description.en)}` : ""}.`,
+    `The room is about ${Math.round(x1 - x0)} cm wide, ${Math.round(z1 - z0)} cm deep and ${place.ceilingCm} cm high${openings ? `, with ${openings}` : ""}.`,
+    furniture.length ? `Furniture in the room: ${furniture.join("; ")}.` : "",
+    "A wide view of the whole room from a corner at eye level, natural soft lighting, clean and detailed anime background art. No people, no text, no logo.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** 家具のデザインのプロンプト。家具1つだけを、白い背景に描く */
+export function furnitureDesignPrompt(f: Furniture, place: Place): string {
+  const kind = FURNITURE_KINDS[f.kind].en;
+  const what = clean(f.name.en) || `a ${kind}`;
+  const room = clean(place.description.en);
+  return [
+    `A design reference picture of a single piece of furniture for an anime-style light novel illustration: ${what} (a ${kind}, about ${Math.round(f.widthCm)} cm wide, ${Math.round(f.depthCm)} cm deep and ${Math.round(f.heightCm)} cm tall).`,
+    `Show the whole piece at a three-quarter front view on a plain white background, clean and detailed anime background-art style${room ? `, matching this room: ${room}` : ""}.`,
+    "Only this one piece of furniture. No people, no room, no text, no logo.",
+  ].join("\n");
+}
+
+/** デザインの絵の大きさ。部屋は横長、家具は正方形(清書では約4MPで描いてから、この大きさにする) */
+export const DESIGN_SIZE = { room: [1600, 1120], furniture: [1024, 1024] } as const;
+
+/** デザインの絵を作って、場所のフォルダーの designs/<id>.png に保存する */
+export async function makeDesign(
+  settings: Settings,
+  placeId: string,
+  prompt: string,
+  size: readonly [number, number],
+  signal: AbortSignal,
+  onStatus: (text: string) => void,
+): Promise<Design> {
+  onStatus("ComfyUI のモデルを確かめています");
+  const models = await detectModels(settings);
+  onStatus("Ollama のモデルを GPU から外しています");
+  await unloadModel(settings);
+  const seed = Math.floor(Math.random() * 2 ** 32);
+  const r = await refine(settings, models, { prompt, width: size[0], height: size[1], seed, images: [] }, signal, (p) => onStatus(progressText(p).replace("清書しています", "デザインを作っています")));
+  const file = `designs/${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}.png`;
+  await savePlaceFile(placeId, file, r.png);
+  return { file, prompt, seed, createdAt: new Date().toISOString() };
+}

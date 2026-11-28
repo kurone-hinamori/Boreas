@@ -3,6 +3,7 @@ import { BODY_PARTS, type BodyPart, Figure, type FigureId, type HandShape, LIMBS
 import { type PoseId, POSES } from "./poses";
 import { dirFromAngles, PROP_COLORS, PROP_KINDS, type PropShape, propMesh } from "./props";
 import { type BuiltCreature, buildCreature, type CreaturePart, type Exaggeration, NO_EXAGGERATION, type StageCreature } from "./creatures";
+import { buildRoom, furnitureMesh, type Place, seatAt, seatHeight, type Visible, visibleFurniture } from "./place";
 
 /** 場面の 3D 表示。下絵(清書に渡す画像)もここで撮る */
 
@@ -66,6 +67,8 @@ export interface StageState {
   creatures?: StageCreature[];
   props: StageProp[];
   contacts: StageContact[];
+  /** 場所(部屋・家具)。ないときは床の目安の円だけ */
+  place?: Place | null;
 }
 
 export interface StageCamera {
@@ -105,6 +108,12 @@ export class Stage {
   private creatures = new THREE.Group();
   private built: BuiltCreature[] = [];
   private handles = new THREE.Group();
+  /** 場所(部屋と家具)。場所が変わったときだけ作り直す */
+  private room = new THREE.Group();
+  private roomMesh: THREE.Group | null = null;
+  private furniture: THREE.Group[] = [];
+  private placeRef: Place | null | undefined = undefined;
+  private ground: THREE.Mesh;
   private loading = 0;
   private aspect = 1;
   private state: StageState = { people: [], props: [], contacts: [] };
@@ -122,7 +131,8 @@ export class Stage {
     // 床の目安(清書では描かない。立ち位置と大きさの手がかり)
     const ground = new THREE.Mesh(new THREE.CircleGeometry(3, 64), new THREE.MeshStandardMaterial({ color: 0xeeeeee }));
     ground.rotation.x = -Math.PI / 2;
-    this.scene.add(ground, this.extras, this.creatures, this.handles);
+    this.ground = ground;
+    this.scene.add(ground, this.room, this.extras, this.creatures, this.handles);
   }
 
   /** 表示する大きさ(px)と、枠の縦横比 */
@@ -135,6 +145,7 @@ export class Stage {
   async setState(state: StageState, selected: number | null) {
     this.state = state;
     this.selected = selected;
+    if (state.place !== this.placeRef) this.buildPlace(state.place ?? null);
     const key = state.people.map((p) => p.figure).join(",");
     if (key !== this.figureKey) {
       const ticket = ++this.loading;
@@ -146,6 +157,28 @@ export class Stage {
       loaded.forEach((f) => this.scene.add(f.root));
     }
     this.apply();
+  }
+
+  /** 部屋と家具を作り直す。場所があるときは、床の目安の円を出さない */
+  private buildPlace(place: Place | null) {
+    this.placeRef = place;
+    this.clear(this.room);
+    this.furniture = [];
+    this.roomMesh = null;
+    this.ground.visible = !place;
+    if (!place) return;
+    this.roomMesh = buildRoom(place);
+    this.furniture = place.furniture.map(furnitureMesh);
+    this.room.add(this.roomMesh, ...this.furniture);
+  }
+
+  /** いまのカメラから見える家具(設計書 5.5:場所があるときは、そのカメラから見える家具の一覧を出す) */
+  visibleFurniture(aspect = this.aspect): Visible[] {
+    if (!this.placeRef) return [];
+    const camera = this.camera.clone();
+    camera.aspect = aspect;
+    camera.updateProjectionMatrix();
+    return visibleFurniture(camera, this.roomMesh, this.furniture);
   }
 
   /** ポーズ → 人ではない登場人物 → つかんだ手足 → 触れる点 → 視線 → 小物 の順に決める */
@@ -165,7 +198,11 @@ export class Stage {
       const f = this.figures[i];
       f.setColor(PERSON_COLORS[p.color % PERSON_COLORS.length].hex);
       f.setHeight(p.heightCm / 100);
-      f.root.position.set(p.x, 0, p.z);
+      // 座るポーズで、場所の椅子・ソファ・ベッドの上にいれば、その座面の高さに合わせる
+      const seatPose = POSES.find((d) => d.id === p.pose)?.seat;
+      const seat = seatPose ? seatAt(this.state.place, p.x, p.z) : null;
+      const kneeHeight = (p.heightCm / 100) * 0.25;
+      f.root.position.set(p.x, seat ? ((seat.elevationCm ?? 0) + seatHeight(seat)) / 100 - kneeHeight : 0, p.z);
       f.root.rotation.y = THREE.MathUtils.degToRad(p.rotation);
       f.pose(p.pose);
       // 小物を持つ手は、形を決めていなければ握る
@@ -174,13 +211,13 @@ export class Stage {
         const shape = p.hands?.[side] ?? "auto";
         f.handShape(side, shape === "auto" && holds(side) ? "fist" : shape);
       }
-      if (POSES.find((d) => d.id === p.pose)?.seat) {
+      if (seatPose && !seat) {
         // 座面の高さは、身長の 0.25 倍ほど(膝の高さ)
-        const h = (p.heightCm / 100) * 0.25;
-        const seat = new THREE.Mesh(new THREE.BoxGeometry(0.42, h, 0.42), new THREE.MeshStandardMaterial({ color: 0x9a7a5a }));
-        seat.position.set(0, h / 2, -0.02);
-        seat.applyMatrix4(f.root.matrix);
-        this.extras.add(seat);
+        const h = kneeHeight;
+        const box = new THREE.Mesh(new THREE.BoxGeometry(0.42, h, 0.42), new THREE.MeshStandardMaterial({ color: 0x9a7a5a }));
+        box.position.set(0, h / 2, -0.02);
+        box.applyMatrix4(f.root.matrix);
+        this.extras.add(box);
       }
     });
 
@@ -401,6 +438,7 @@ export class Stage {
     this.clear(this.extras);
     this.clear(this.handles);
     this.clear(this.creatures);
+    this.clear(this.room);
     this.renderer.dispose();
   }
 }

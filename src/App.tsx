@@ -7,12 +7,13 @@ import { confirmLeave } from "./lib/leaveGuard";
 import { SceneList } from "./components/SceneList";
 import { SceneEditor } from "./components/SceneEditor";
 import { PlaceList } from "./components/PlaceList";
+import { PlaceEditor } from "./components/PlaceEditor";
 import { CharacterList } from "./components/CharacterList";
 import { SettingsView } from "./components/SettingsView";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
-export type View = { kind: "scenes" } | { kind: "scene"; id: string } | { kind: "places" } | { kind: "characters" } | { kind: "settings" };
+export type View = { kind: "scenes" } | { kind: "scene"; id: string } | { kind: "places" } | { kind: "place"; id: string } | { kind: "characters" } | { kind: "settings" };
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: "scenes" });
@@ -51,7 +52,7 @@ export default function App() {
       <aside className="side">
         <div className="brand">BOREAS</div>
         {nav("場面", { kind: "scenes" }, view.kind === "scenes" || view.kind === "scene")}
-        {nav("場所", { kind: "places" }, view.kind === "places")}
+        {nav("場所", { kind: "places" }, view.kind === "places" || view.kind === "place")}
         {nav("キャラクター", { kind: "characters" }, view.kind === "characters")}
         <div className="spacer" />
         {nav("設定", { kind: "settings" }, view.kind === "settings")}
@@ -60,13 +61,15 @@ export default function App() {
       <main className="main">
         <UpdateBanner />
         <div className="content">
-          <ErrorBoundary key={view.kind === "scene" ? `scene:${view.id}` : view.kind} onBack={() => setView({ kind: "scenes" })}>
+          <ErrorBoundary key={view.kind === "scene" ? `scene:${view.id}` : view.kind === "place" ? `place:${view.id}` : view.kind} onBack={() => setView({ kind: "scenes" })}>
             {!ready ? null : view.kind === "scenes" ? (
               <SceneList onOpen={(id) => setView({ kind: "scene", id })} />
             ) : view.kind === "scene" ? (
               <SceneEditor id={view.id} settings={settings} onBack={() => go({ kind: "scenes" })} />
             ) : view.kind === "places" ? (
-              <PlaceList />
+              <PlaceList onOpen={(id) => setView({ kind: "place", id })} />
+            ) : view.kind === "place" ? (
+              <PlaceEditor id={view.id} settings={settings} onBack={() => go({ kind: "places" })} />
             ) : view.kind === "characters" ? (
               <CharacterList onSettings={() => setView({ kind: "settings" })} />
             ) : (

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
 import type { CharacterSummary, Settings } from "../types";
 import { BODY_PARTS, type BodyPart, FIGURES, type FigureId, HAND_SHAPES, type HandShape, LIMBS, type LimbId, PERSON_COLORS } from "../lib/figures";
@@ -44,7 +44,9 @@ import {
 } from "../lib/scene";
 import { type ContactFrom, type ContactTo, type Gaze, isCreatureTarget, type StageCamera } from "../lib/stage";
 import { estimateBody } from "../lib/ollama";
-import { deleteScene, listEurosCharacters, listEurosEquipment, loadEurosCharacter, loadScene, openSceneFolder, saveScene } from "../lib/storage";
+import { furnitureColor, furnitureLabel, isSeat, normalizePlace, onFloor, type Place, seatPose, type Visible } from "../lib/place";
+import { PlanView } from "./PlanView";
+import { deleteScene, listEurosCharacters, listEurosEquipment, listPlaceData, loadEurosCharacter, loadPlace, loadScene, openSceneFolder, saveScene } from "../lib/storage";
 import { Viewport, type ViewportHandle } from "./Viewport";
 import { RefinePanel } from "./RefinePanel";
 
@@ -131,7 +133,57 @@ function framing(scene: Scene, extent: number, center: number): StageCamera {
   return { ...c, distance: r(distance), targetY: r(h * center), targetX: r(cx), targetZ: r(cz) };
 }
 
-type Tab = "people" | "creatures" | "props" | "contacts" | "camera";
+type Tab = "place" | "people" | "creatures" | "props" | "contacts" | "camera";
+
+/** カメラの位置(m)。Stage.setCamera と同じ計算 */
+function cameraPosition(c: StageCamera): [number, number, number] {
+  const yaw = (c.yaw * Math.PI) / 180;
+  const pitch = (c.pitch * Math.PI) / 180;
+  return [(c.targetX ?? 0) + c.distance * Math.cos(pitch) * Math.sin(yaw), c.targetY + c.distance * Math.sin(pitch), (c.targetZ ?? 0) + c.distance * Math.cos(pitch) * Math.cos(yaw)];
+}
+
+const NO_WARNINGS = new Set<string>();
+
+/** カメラが部屋の外(床の外・天井より上・床より下)にあるか */
+function outsideRoom(place: Place, c: StageCamera): boolean {
+  const [x, y, z] = cameraPosition(c);
+  return !onFloor(place.floor, [x * 100, z * 100]) || y * 100 > place.ceilingCm || y < 0;
+}
+
+/** 間取り図に描くカメラ(位置と左右の画角) */
+function planCamera(c: StageCamera, aspect: number) {
+  const [x, , z] = cameraPosition(c);
+  const hHalf = Math.tan((c.fov * Math.PI) / 360) * aspect;
+  return { x, z, yaw: c.yaw, fov: (Math.atan(hHalf) * 360) / Math.PI };
+}
+
+/** カメラから見える家具の一覧(設計書 5.5) */
+function VisibleList({ place, visible }: { place: Place; visible: Visible[] }) {
+  const seen = [...visible].sort((a, b) => b.ratio - a.ratio);
+  const hidden = place.furniture.filter((f) => !visible.some((v) => v.id === f.id));
+  return (
+    <div className="visible-list">
+      <div className="small-text">このカメラから見える家具:</div>
+      {seen.length ? (
+        <ul>
+          {seen.map((v) => {
+            const f = place.furniture.find((x) => x.id === v.id);
+            if (!f) return null;
+            return (
+              <li key={v.id}>
+                <span className="swatch" style={{ background: hex(furnitureColor(f).hex) }} /> {furnitureLabel(f)}
+                {v.ratio < 0.5 && <span className="muted">(一部)</span>}
+              </li>
+            );
+          })}
+        </ul>
+      ) : (
+        <div className="muted small-text">なし</div>
+      )}
+      {hidden.length > 0 && <div className="muted small-text">見えない:{hidden.map(furnitureLabel).join("・")}(清書のプロンプトには書きません)</div>}
+    </div>
+  );
+}
 
 /** 大きさ(m)を cm の入力にする */
 const toCm = (m: number) => Math.round(m * 1000) / 10;
@@ -147,6 +199,10 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
   const [equipment, setEquipment] = useState<Record<string, EurosEquipment>>({});
   const [estimating, setEstimating] = useState("");
   const [tab, setTab] = useState<Tab>("people");
+  const [place, setPlace] = useState<Place | null>(null);
+  const [placeError, setPlaceError] = useState("");
+  const [places, setPlaces] = useState<Place[]>([]);
+  const [visible, setVisible] = useState<Visible[]>([]);
   const viewport = useRef<ViewportHandle>(null);
   const saveTimer = useRef<number | undefined>(undefined);
   const pending = useRef<Scene | null>(null);
@@ -156,6 +212,7 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
       .then(async (raw) => {
         const s = normalizeScene(raw);
         setScene(s);
+        if (s.place) void openPlace(s.place.id);
         setSelected(s.people.length ? 0 : null);
         setSelectedCreature(s.creatures.length ? 0 : null);
         const ids = [...new Set([...s.people, ...s.creatures].map((p) => p.characterId))];
@@ -169,7 +226,28 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
     listEurosEquipment()
       .then((list) => setEquipment(Object.fromEntries(list.map((e) => [e.id, e]))))
       .catch(() => undefined);
+    listPlaceData()
+      .then(setPlaces)
+      .catch(() => undefined);
   }, [id]);
+
+  /** 場面の場所を読む(場所は「場所」の画面で直されるので、場面を開くたびに読み直す) */
+  async function openPlace(placeId: string | null) {
+    setPlaceError("");
+    setVisible([]);
+    if (!placeId) return setPlace(null);
+    try {
+      setPlace(normalizePlace(await loadPlace(placeId)));
+    } catch (e) {
+      setPlace(null);
+      setPlaceError(message(e));
+    }
+  }
+
+  // 3D に渡す状態(場面と、読み込んだ場所)。場面が変わらなければ同じものを渡す
+  const stageState = useMemo(() => (scene ? { ...scene, place } : null), [scene, place]);
+  const room = useMemo(() => (place ? { place, visible } : null), [place, visible]);
+  const reportVisible = useCallback((v: Visible[]) => setVisible((prev) => (JSON.stringify(prev) === JSON.stringify(v) ? prev : v)), []);
 
   const flush = useCallback(async () => {
     window.clearTimeout(saveTimer.current);
@@ -212,7 +290,7 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
       </div>
     );
   }
-  if (!scene) return <div className="page muted">読み込み中…</div>;
+  if (!scene || !stageState) return <div className="page muted">読み込み中…</div>;
 
   const sel = selected !== null ? scene.people[selected] : undefined;
   const setPersonAt = (i: number, patch: Partial<ScenePerson>) => change((s) => ({ ...s, people: s.people.map((p, k) => (k === i ? { ...p, ...patch } : p)) }));
@@ -423,6 +501,7 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
           <div className="tabs side-tabs">
             {(
               [
+                ["place", place ? `場所:${place.title || "無題"}` : "場所"],
                 ["people", `人物(${scene.people.length})`],
                 ["creatures", `人ではない(${scene.creatures.length})`],
                 ["props", `小物(${scene.props.length})`],
@@ -953,6 +1032,76 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
             </>
           )}
 
+          {tab === "place" && (
+            <>
+              <section className="card">
+                <label className="field">
+                  <span>場所(「場所」の画面で作った部屋)</span>
+                  <select
+                    value={scene.place?.id ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      change((s) => ({ ...s, place: v ? { id: v } : null }), true);
+                      void openPlace(v || null);
+                    }}
+                  >
+                    <option value="">場所なし(背景は文章だけ)</option>
+                    {scene.place && !places.some((p) => p.id === scene.place!.id) && <option value={scene.place.id}>(見つかりません)</option>}
+                    {places.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.title || "無題の場所"}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {placeError && <small className="error">場所を読み込めませんでした:{placeError}</small>}
+                {!places.length && <small className="muted">まだ場所がありません。「場所」の画面で作ります。</small>}
+                {place && (
+                  <small className="muted">
+                    間取り・家具・デザインは「場所」の画面で直します。直すと、この場所を使うすべての場面に効きます。人物は部屋の座標(間取り図と同じ位置)に立ちます。
+                  </small>
+                )}
+              </section>
+              {place && (
+                <>
+                  <section className="card">
+                    <PlanView
+                      place={place}
+                      selected={null}
+                      warned={NO_WARNINGS}
+                      onSelect={() => undefined}
+                      onMoveFurniture={() => undefined}
+                      onMoveOpening={() => undefined}
+                      marks={[
+                        ...scene.people.map((p) => ({ x: p.x, z: p.z, color: PERSON_COLORS[p.color % PERSON_COLORS.length].hex, label: p.name })),
+                        ...scene.creatures.map((c) => ({ x: c.x, z: c.z, color: PERSON_COLORS[c.color % PERSON_COLORS.length].hex, label: c.name })),
+                      ]}
+                      camera={planCamera(scene.camera, frame.width / frame.height)}
+                    />
+                    <VisibleList place={place} visible={visible} />
+                  </section>
+                  {place.furniture.some(isSeat) && (
+                    <section className="card">
+                      <h3>座らせる</h3>
+                      {sel && selected !== null ? (
+                        <div className="row" style={{ marginBottom: 0 }}>
+                          {place.furniture.filter(isSeat).map((f) => (
+                            <button key={f.id} className="small" onClick={() => setPerson({ ...seatPose(f), pose: "sit", ik: {} })}>
+                              {sel.name}を{furnitureLabel(f)}に座らせる
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <small className="muted">人物を選ぶと、椅子・ソファ・ベッドに座らせられます。</small>
+                      )}
+                      <small className="muted">「座る」のポーズで座面の上にいると、座面の高さに合わせます。</small>
+                    </section>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
           {tab === "camera" && (
             <section className="card">
               <label className="field">
@@ -982,6 +1131,12 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
               <Slider label="注視点の高さ" unit="m" value={scene.camera.targetY} min={-0.5} max={3} step={0.01} onChange={(v) => setCamera({ ...scene.camera, targetY: v })} />
               <Slider label="画角" unit="°" value={scene.camera.fov} min={15} max={80} step={1} onChange={(v) => setCamera({ ...scene.camera, fov: v })} />
               <small className="muted">何もない所をドラッグで回す・Shift+ドラッグで高さ・Ctrl+ドラッグで平行移動・ホイールで近づける。</small>
+              {place && (
+                <>
+                  {outsideRoom(place, scene.camera) && <p className="error small-text">カメラが部屋の外にあります。手前の壁と天井は写らず、部屋を切り取った絵になります。</p>}
+                  <VisibleList place={place} visible={visible} />
+                </>
+              )}
             </section>
           )}
         </div>
@@ -989,7 +1144,8 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
         <div className="editor-main">
           <Viewport
             ref={viewport}
-            state={scene}
+            state={stageState}
+            onVisible={reportVisible}
             selected={selected}
             camera={scene.camera}
             aspect={frame.width / frame.height}
@@ -1010,7 +1166,7 @@ export function SceneEditor({ id, settings, onBack }: { id: string; settings: Se
         </div>
       </div>
 
-      <RefinePanel scene={scene} characters={characters} equipment={equipment} settings={settings} viewport={viewport} change={change} flush={flush} />
+      <RefinePanel scene={scene} characters={characters} equipment={equipment} room={room} settings={settings} viewport={viewport} change={change} flush={flush} />
     </div>
   );
 }

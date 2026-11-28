@@ -16,7 +16,11 @@ import {
   STANCES,
   type StageCreature,
 } from "./creatures";
+import { FURNITURE_KINDS, furnitureColor, type Place, ROOM_COLORS, seatAt, type Visible } from "./place";
 import { DEFAULT_CAMERA, isCreatureTarget, type StageCamera, type StageContact, type StagePerson, type StageProp } from "./stage";
+
+/** 清書に渡す画像の数の上限(Picture 1 の下絵を含む)。部屋・家具のデザインは、見えている割合の大きい物からこの数まで渡し、残りは文章で伝える */
+export const MAX_PICTURES = 8;
 
 /** 場面に置ける登場人物(人物と、人ではない登場人物を合わせて)の数(参照画像の数と、描き分けの安定性から) */
 export const MAX_CHARACTERS = PERSON_COLORS.length;
@@ -94,7 +98,7 @@ export interface Take {
   seed: number;
   prompt: string;
   /** Picture 2 以降に渡したシート(Euros のキャラクター、または装備品の id と版の id) */
-  sheets: ({ characterId: string; revisionId: string | null } | { equipmentId: string; revisionId: string | null })[];
+  sheets: ({ characterId: string; revisionId: string | null } | { equipmentId: string; revisionId: string | null } | { placeId: string; furnitureId?: string; design: string })[];
   /** ComfyUI に送ったワークフロー(API 形式) */
   workflow?: unknown;
   /** 失敗したときのエラー */
@@ -114,7 +118,9 @@ export interface Scene {
   props: SceneProp[];
   contacts: SceneContact[];
   camera: StageCamera;
-  /** 背景(場所を使わないとき、背景は文章だけで決める) */
+  /** 場所(Boreas のライブラリの places/<id>)。null なら場所なし(背景は文章だけ) */
+  place: { id: string } | null;
+  /** 背景(場所がないときは背景そのもの。場所があるときは、時間帯や窓の外など部屋の説明に足すこと) */
   background: Text;
   takes: Take[];
   /** 採用した清書(Take の id) */
@@ -140,6 +146,7 @@ export function newScene(title: string): Scene {
     props: [],
     contacts: [],
     camera: { ...DEFAULT_CAMERA },
+    place: null,
     background: emptyText(),
     takes: [],
     adopted: null,
@@ -154,6 +161,7 @@ export function normalizeScene(s: Scene): Scene {
     props: s.props ?? [],
     contacts: s.contacts ?? [],
     camera: { ...DEFAULT_CAMERA, ...s.camera },
+    place: s.place ?? null,
     people: s.people.map((p) => ({ hands: { l: "auto", r: "auto" }, ik: {}, gaze: { kind: "manual" }, ...p })),
   };
 }
@@ -322,10 +330,18 @@ export function changeForm(body: CreatureBody, form: CreatureBody["form"]): Crea
 
 // ---------------------------------------------------------------- 清書に渡す画像
 
-/** Picture 2 以降に渡す画像:人物のシート(人物の順)→ 人ではない登場人物のシート → 装備品のデザイン */
+/** Picture 2 以降に渡す画像:人物のシート(人物の順)→ 人ではない登場人物のシート → 装備品のデザイン → 部屋のデザイン → 家具のデザイン */
 export type Reference =
   | { kind: "character"; characterId: string; revisionId: string; image: string }
-  | { kind: "equipment"; equipmentId: string; revisionId: string | null; image: string };
+  | { kind: "equipment"; equipmentId: string; revisionId: string | null; image: string }
+  | { kind: "place"; placeId: string; image: string }
+  | { kind: "furniture"; placeId: string; furnitureId: string; image: string };
+
+/** 場面の場所と、いまのカメラから見える家具 */
+export interface Room {
+  place: Place;
+  visible: Visible[];
+}
 
 export interface References {
   /** 渡す画像の順(シートがない登場人物は null) */
@@ -334,9 +350,19 @@ export interface References {
   person: number[];
   creature: number[];
   equipment: Record<string, number>;
+  /** 部屋のデザインと家具のデザイン(渡さないときはない) */
+  room?: number;
+  furniture: Record<string, number>;
 }
 
-export function referencesOf(scene: Scene, characters: Record<string, EurosCharacter>, equipment: Record<string, EurosEquipment> = {}): References {
+/** 見えている家具を、見えている割合の大きい順に */
+export const visibleOrder = (room: Room) =>
+  [...room.visible]
+    .sort((a, b) => b.ratio - a.ratio)
+    .map((v) => room.place.furniture.find((f) => f.id === v.id))
+    .filter((f) => !!f);
+
+export function referencesOf(scene: Scene, characters: Record<string, EurosCharacter>, equipment: Record<string, EurosEquipment> = {}, room?: Room | null): References {
   const list: (Reference | null)[] = [];
   const sheetOf = (characterId: string): Reference | null => {
     const c = characters[characterId];
@@ -353,7 +379,15 @@ export function referencesOf(scene: Scene, characters: Record<string, EurosChara
     if (!e || !im || eq[e.id]) continue;
     eq[e.id] = list.push({ kind: "equipment", equipmentId: e.id, ...im }) + 1;
   }
-  return { list, person, creature, equipment: eq };
+  // 部屋と家具のデザインは、上限(MAX_PICTURES)まで。見えない家具のデザインは渡さない
+  const full = () => list.length + 1 >= MAX_PICTURES;
+  const roomPicture = room?.place.design && !full() ? list.push({ kind: "place", placeId: room.place.id, image: room.place.design.file }) + 1 : undefined;
+  const furniture: Record<string, number> = {};
+  for (const f of room ? visibleOrder(room) : []) {
+    if (!f.design || full()) continue;
+    furniture[f.id] = list.push({ kind: "furniture", placeId: room!.place.id, furnitureId: f.id, image: f.design.file }) + 1;
+  }
+  return { list, person, creature, equipment: eq, room: roomPicture, furniture };
 }
 
 // ---------------------------------------------------------------- 清書のプロンプト
@@ -410,14 +444,17 @@ const HAND_EN: Record<string, string> = { fist: "clenched in a fist", point: "po
  * 清書のプロンプト。検証で効いた形(設計書 5.7):
  * Picture 1 = 下絵は位置・ポーズ・向き・カメラだけに使い、素体の体や色は描かない。Picture 2〜 = 人物のシート(色の順)
  */
-export function buildPrompt(scene: Scene, characters: Record<string, EurosCharacter>, equipment: Record<string, EurosEquipment> = {}): string {
+export function buildPrompt(scene: Scene, characters: Record<string, EurosCharacter>, equipment: Record<string, EurosEquipment> = {}, room?: Room | null): string {
   const { people, props, contacts } = scene;
   const creatures = scene.creatures ?? [];
-  const refs = referencesOf(scene, characters, equipment);
-  const seat = people.some((p) => POSES.find((d) => d.id === p.pose)?.seat);
+  const refs = referencesOf(scene, characters, equipment, room);
+  // 場所の椅子・ソファ・ベッドに座っていれば、その家具に座る。そうでなければ茶色の箱(座面の目安)に座る
+  const seated = (p: ScenePerson) => !!POSES.find((d) => d.id === p.pose)?.seat;
+  const seatOf = (p: ScenePerson) => (seated(p) ? seatAt(room?.place, p.x, p.z) : null);
+  const seat = people.some((p) => seated(p) && !seatOf(p));
   const total = people.length + creatures.length;
   const count = total === 1 ? "one character" : `${total} characters`;
-  const avoid = ["the figures", "their bare bodies", "the colors of the figures and objects", "the gray floor disc"];
+  const avoid = ["the figures", "their bare bodies", "the colors of the figures and objects", room ? "the plain flat colors of the walls, floor and furniture" : "the gray floor disc"];
   const lines = [
     `Redraw <Picture 1> as a finished, high-quality anime-style light novel ${scene.frame === "cover" ? "cover illustration" : "illustration"} with ${count}.`,
     `<Picture 1> is only a rough 3D sketch of featureless posable figures and simple shapes: use it ONLY for each character's position, pose, body direction, head direction, arm and leg positions, the objects, the sizes and distances, the camera angle and the framing. Keep all of these exactly. Do not draw ${avoid.join(", ")}${seat ? "; the brown box is the chair or seat they sit on" : ""}.`,
@@ -426,7 +463,7 @@ export function buildPrompt(scene: Scene, characters: Record<string, EurosCharac
     const c = characters[p.characterId];
     const parts = [
       `- The ${colorOf(p)} figure is ${c?.profile?.name ? `${c.profile.name}, ` : ""}the character from the character sheet <Picture ${refs.person[i]}>${c && lookOf(c) ? `: ${lookOf(c)}` : ""}.`,
-      `Pose: ${poseEn(p.pose)}${clean(p.action.en) ? `, ${clean(p.action.en)}` : ""}.`,
+      `Pose: ${seatOf(p) ? SEAT_EN[seatOf(p)!.kind] : poseEn(p.pose)}${clean(p.action.en) ? `, ${clean(p.action.en)}` : ""}.`,
     ];
     const hands = (["l", "r"] as const).filter((side) => HAND_EN[p.hands?.[side] ?? ""]).map((side) => `${sideEn(side)} hand ${HAND_EN[p.hands![side]]}`);
     if (hands.length) parts.push(`Hands: ${hands.join(", ")}.`);
@@ -458,6 +495,7 @@ export function buildPrompt(scene: Scene, characters: Record<string, EurosCharac
     const big = isExaggerated(pr.scale) ? " It is deliberately drawn larger than its real size for emphasis; keep exactly this size, do not shrink it to a realistic size." : "";
     lines.push(`- The ${color} object is ${what}${picture} (${size})${where}. Draw it at exactly the size and position shown in <Picture 1>.${big}`);
   });
+  if (room) lines.push(...roomLines(room, refs));
   contacts.forEach((c) => {
     const target = isCreatureTarget(c.to)
       ? `${whoCreature(creatures, c.to.creature)}'s ${CREATURE_PARTS[c.to.part].en}`
@@ -481,6 +519,29 @@ export function buildPrompt(scene: Scene, characters: Record<string, EurosCharac
   lines.push(`Match the art style of ${sheets}${styles.length ? `: ${styles.join("; ")}` : ""}.`);
   lines.push(`${clean(scene.background.en) ? `Background: ${clean(scene.background.en)}. ` : ""}Full color, no text, no logo.`);
   return lines.join("\n");
+}
+
+const SEAT_EN: Record<string, string> = { chair: "sitting on the chair", sofa: "sitting on the sofa", bed: "sitting on the edge of the bed" };
+
+/** 部屋と、カメラから見える家具のプロンプト。見えない家具は書かない(同じ部屋の別の場面で、見える物が食い違わないように) */
+function roomLines(room: Room, refs: References): string[] {
+  const { place } = room;
+  const desc = clean(place.description.en);
+  const kinds = new Set(place.openings.map((o) => o.kind));
+  const openings = [kinds.has("window") ? `the windows (${ROOM_COLORS.window.en})` : "", kinds.has("door") ? `the doors (${ROOM_COLORS.door.en})` : ""].filter(Boolean).join(" and ");
+  const same = refs.room ? `. It is the room shown in <Picture ${refs.room}>; draw its walls, floor, windows and lighting in the same way` : "";
+  const lines = [
+    `- The room: the ${ROOM_COLORS.wall.en} walls, the ${ROOM_COLORS.floor.en} floor and the ceiling in <Picture 1> are the walls, floor and ceiling of ${desc ? `this room: ${desc}` : "the room"}${same}. Keep the shape of the room${openings ? ` and ${openings}` : ""} exactly where they are in <Picture 1>.`,
+  ];
+  const furniture = visibleOrder(room);
+  for (const f of furniture) {
+    const what = clean(f.name.en) || `a ${FURNITURE_KINDS[f.kind].en}`;
+    const picture = refs.furniture[f.id] ? `, the furniture shown in <Picture ${refs.furniture[f.id]}>` : "";
+    const size = `about ${Math.round(f.widthCm)} cm wide, ${Math.round(f.depthCm)} cm deep, ${Math.round(f.heightCm)} cm tall`;
+    lines.push(`- The ${furnitureColor(f).en} box shape is the ${FURNITURE_KINDS[f.kind].en}: ${what}${picture} (${size}). Keep its size, direction and position exactly as in <Picture 1>.`);
+  }
+  lines.push(furniture.length ? "Draw only the furniture shown in <Picture 1>; do not add other large furniture." : "No furniture of the room is visible from this camera; do not add large furniture.");
+  return lines;
 }
 
 /** 一覧に出す絵:採用した清書、なければ最後の清書か下絵 */

@@ -147,3 +147,33 @@ small.muted { font-size: 12px; }
 .check input[type="checkbox"] { width: auto; }
 .exaggerate { border-top: 1px solid var(--line); padding-top: 8px; margin: 8px 0 12px; }
 .exaggerate summary { cursor: pointer; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+
+/* ---------------------------------------------------------------- 場所 */
+.place-main { align-items: stretch; }
+.plan { width: 100%; max-height: 460px; background: #fff; border: 1px solid var(--line); border-radius: var(--radius); touch-action: none; user-select: none; }
+.editor-side .plan { max-height: 260px; }
+.plan-grid { stroke: #ececec; stroke-width: 1; }
+.plan-grid.major { stroke: #d8d8d8; }
+.plan-wall { stroke: #222; stroke-width: 6; stroke-linecap: square; }
+.plan-opening { cursor: move; }
+.plan-opening.selected line:first-of-type, .plan-opening.selected line:nth-of-type(1) { stroke-width: 12; }
+.plan-swing { fill: none; stroke: #888; stroke-width: 1.5; stroke-dasharray: 4 3; }
+.plan-furniture { cursor: move; }
+.plan-furniture polygon { stroke: #333; stroke-width: 1.5; }
+.plan-furniture.selected polygon { stroke: #000; stroke-width: 4; }
+.plan-furniture.warned polygon, .plan-opening.warned line:first-of-type { stroke-dasharray: 8 5; stroke: #000; stroke-width: 3; }
+.plan-front { stroke: #000; stroke-width: 4; }
+.plan-label { font-size: 13px; text-anchor: middle; dominant-baseline: middle; fill: #111; pointer-events: none; paint-order: stroke; stroke: #fff; stroke-width: 3px; }
+.plan-mark circle { stroke: #fff; stroke-width: 3; }
+.plan-camera path { fill: rgba(0, 0, 0, 0.08); stroke: #555; stroke-width: 1.5; }
+.plan-camera circle { fill: #111; }
+.design-box { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 12px; }
+.design-box img, .design-box .noimage { width: 100%; max-height: 240px; object-fit: contain; background: var(--hover); border: 1px solid var(--line); border-radius: var(--radius); display: flex; align-items: center; justify-content: center; color: var(--muted); min-height: 80px; font-size: 12px; }
+.floor-rect { border-left: 2px solid var(--line); padding-left: 10px; margin: 8px 0 10px; }
+.selected-card { border-color: var(--strong); }
+.warnings { margin: 0; padding-left: 18px; font-size: 13px; }
+.warnings li { margin-bottom: 4px; }
+button.link { border: none; background: none; padding: 0; text-align: left; text-decoration: underline; text-underline-offset: 3px; }
+.visible-list { margin-top: 8px; font-size: 13px; }
+.visible-list ul { margin: 4px 0; padding-left: 4px; list-style: none; }
+.visible-list li { display: flex; align-items: center; gap: 6px; }
