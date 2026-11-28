@@ -61,7 +61,7 @@ blender -b --python tools/make_figure.py -- --all public/figures
 
 人ではない登場人物の形は `src/lib/creatures.ts` で、型と大きさから three.js で作ります(素体のファイルはありません)。`http://localhost:1430/dev/creatures.html` で形の種類と、鈴がバットをスライムに振り下ろす場面の下絵を確かめられます。
 
-場所の部屋と家具は `src/lib/place.ts` で、間取り(cm)から three.js で作ります。`http://localhost:1430/dev/places.html` で、確かめる部屋(鈴の部屋)の寸法の点検と、同じ部屋の2つの場面(机・ベッド)の下絵・見える家具・プロンプトを確かめられます。
+場所の部屋と家具は `src/lib/place.ts` で、間取り(cm)から three.js で作ります。`http://localhost:1430/dev/places.html` で、確かめる部屋(鈴の部屋)の寸法の点検と、同じ部屋の2つの場面(机・ベッド)の下絵・見える家具・プロンプトを確かめられます。`dev/verify/capture.mjs`(headless Chrome でこのページの出力を保存)と `dev/verify/refine.mjs`(デザインと清書を ComfyUI で作る)で、清書まで確かめられます(使い方は各ファイルの先頭)。
 
 ## 保存先
 
