@@ -109,8 +109,8 @@ export interface Place {
   furniture: Furniture[];
   /** 部屋の説明(壁・床・窓の外・明かりなど) */
   description: Text;
-  /** 画風(部屋と家具のデザインのプロンプトの先頭に入れる)。空なら既定の画風(design.ts の DEFAULT_STYLE_EN) */
-  style: Text;
+  /** 画風(英語のみ。部屋と家具のデザインのプロンプトの先頭に「<style>.」として入れる)。空なら画風の行を入れない。Euros の character.json の style と同じ方式 */
+  style: string;
   /** 部屋のデザイン(人物のいない部屋の絵)。清書で背景の参照にする */
   design: Design | null;
 }
@@ -137,9 +137,34 @@ export function newPlace(title: string): Place {
     openings: [],
     furniture: [],
     description: { ja: "", en: "" },
-    style: { ja: "", en: "" },
+    style: STYLE_PRESETS[0].en,
     design: null,
   };
+}
+
+/**
+ * 画風のプリセット(表示名 → 英語)。Euros の STYLE_PRESETS と同じ文を持つ。変えるときは両方そろえる(設計書 5.4)。
+ * 選ぶとこの英文が画風の欄に入る。新しい場所の既定値は先頭のもの
+ */
+export const STYLE_PRESETS: readonly { label: string; en: string }[] = [
+  { label: "アニメ(セル塗り)", en: "Japanese anime style, clean thin line art, flat cel shading, soft natural colors" },
+  { label: "アニメ(柔らかい塗り)", en: "Japanese anime illustration style, clean line art, soft gradient shading, gentle lighting" },
+  { label: "セミリアル", en: "semi-realistic digital painting, detailed rendering, soft studio lighting" },
+  { label: "デフォルメ", en: "cute chibi style with big head and small body, simple clean line art, flat colors" },
+];
+
+/**
+ * 画風を読み込む。v0.5.0(PR #8)の { ja, en } 形式なら英語の値を使う(英語が空で日本語だけあるときは、消さないよう日本語をそのまま入れる)。
+ * どちらも空なら空のまま(既存の場所を勝手に変えない)
+ */
+export function normalizeStyle(s: unknown): string {
+  if (typeof s === "string") return s;
+  if (s && typeof s === "object") {
+    const { ja, en } = s as { ja?: unknown; en?: unknown };
+    const pick = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+    return pick(en) || pick(ja);
+  }
+  return "";
 }
 
 export function normalizePlace(p: Place): Place {
@@ -150,7 +175,7 @@ export function normalizePlace(p: Place): Place {
     openings: p.openings ?? [],
     furniture: (p.furniture ?? []).map((f) => ({ ...f, name: f.name ?? { ja: "", en: "" }, design: f.design ?? null })),
     description: p.description ?? { ja: "", en: "" },
-    style: p.style ?? { ja: "", en: "" },
+    style: normalizeStyle((p as { style?: unknown }).style),
     design: p.design ?? null,
   };
 }
