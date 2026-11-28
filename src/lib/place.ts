@@ -456,12 +456,16 @@ export function seatPose(f: Furniture): { x: number; z: number; rotation: number
 export const ROOM_COLORS = {
   floor: { hex: 0xc4c4c4, en: "medium gray" },
   wall: { hex: 0xe2e2e2, en: "light gray" },
+  /** 左右(X の向き)の壁。奥の壁と少しだけ変え、部屋の角が分かるようにする */
+  sideWall: { hex: 0xd4d4d4, en: "light gray" },
   ceiling: { hex: 0xeeeeee, en: "light gray" },
   door: { hex: 0x5a5a5a, en: "dark gray" },
   window: { hex: 0xa8d0f0, en: "pale blue" },
 } as const;
 
 const mat = (hex: number) => new THREE.MeshStandardMaterial({ color: hex, roughness: 0.8, metalness: 0 });
+/** 部屋の面は明かりで暗くしない(影になった壁が、ドアと同じ濃い灰色に見えて、清書でドアに描かれた) */
+const flat = (hex: number) => new THREE.MeshBasicMaterial({ color: hex });
 
 /** 部屋(床・壁・天井・窓・ドア)。壁と天井は内側からだけ見える(外にカメラを置くと、手前の壁は写らない) */
 export function buildRoom(place: Place): THREE.Group {
@@ -469,12 +473,12 @@ export function buildRoom(place: Place): THREE.Group {
   g.name = "room";
   const H = place.ceilingCm / 100;
   for (const r of place.floor) {
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(r.width / 100, r.depth / 100), mat(ROOM_COLORS.floor.hex));
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(r.width / 100, r.depth / 100), flat(ROOM_COLORS.floor.hex));
     floor.rotation.x = -Math.PI / 2;
     floor.position.set((r.x + r.width / 2) / 100, 0, (r.z + r.depth / 2) / 100);
     floor.userData.surface = "floor";
     const ceiling = floor.clone();
-    ceiling.material = mat(ROOM_COLORS.ceiling.hex);
+    ceiling.material = flat(ROOM_COLORS.ceiling.hex);
     ceiling.rotation.x = Math.PI / 2;
     ceiling.position.y = H;
     ceiling.userData.surface = "ceiling";
@@ -497,12 +501,12 @@ export function buildRoom(place: Place): THREE.Group {
       if (u1 <= u0 || v1 <= v0) continue;
       shape.holes.push(new THREE.Path([new THREE.Vector2(u0, v0), new THREE.Vector2(u0, v1), new THREE.Vector2(u1, v1), new THREE.Vector2(u1, v0)]));
       // 穴の奥に、ドアの板・窓のガラスを置く
-      const panel = new THREE.Mesh(new THREE.PlaneGeometry(u1 - u0, v1 - v0), mat(o.kind === "door" ? ROOM_COLORS.door.hex : ROOM_COLORS.window.hex));
+      const panel = new THREE.Mesh(new THREE.PlaneGeometry(u1 - u0, v1 - v0), flat(o.kind === "door" ? ROOM_COLORS.door.hex : ROOM_COLORS.window.hex));
       panel.position.set((u0 + u1) / 2, (v0 + v1) / 2, -0.04);
       panel.userData.surface = o.kind;
       panels.push(panel);
     }
-    const wall = new THREE.Mesh(new THREE.ShapeGeometry(shape), mat(ROOM_COLORS.wall.hex));
+    const wall = new THREE.Mesh(new THREE.ShapeGeometry(shape), flat(w.normal[0] !== 0 ? ROOM_COLORS.sideWall.hex : ROOM_COLORS.wall.hex));
     wall.userData.surface = "wall";
     // 壁の面の向き:u = a→b、法線(+Z)= 部屋の内側
     const holder = new THREE.Group();

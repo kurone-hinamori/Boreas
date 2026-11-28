@@ -531,7 +531,7 @@ function roomLines(room: Room, refs: References): string[] {
   const openings = [kinds.has("window") ? `the windows (${ROOM_COLORS.window.en})` : "", kinds.has("door") ? `the doors (${ROOM_COLORS.door.en})` : ""].filter(Boolean).join(" and ");
   const same = refs.room ? `. It is the room shown in <Picture ${refs.room}>; draw its walls, floor, windows and lighting in the same way` : "";
   const lines = [
-    `- The room: the ${ROOM_COLORS.wall.en} walls, the ${ROOM_COLORS.floor.en} floor and the ceiling in <Picture 1> are the walls, floor and ceiling of ${desc ? `this room: ${desc}` : "the room"}${same}. Keep the shape of the room${openings ? ` and ${openings}` : ""} exactly where they are in <Picture 1>, but paint the walls, floor and ceiling with the room's own materials and colors (its flooring and wallpaper), never plain gray.`,
+    `- The room: the ${ROOM_COLORS.wall.en} walls, the ${ROOM_COLORS.floor.en} floor and the ceiling in <Picture 1> are the walls, floor and ceiling of ${desc ? `this room: ${desc}` : "the room"}${same}. Keep the shape of the room${openings ? ` and ${openings}` : ""} exactly where they are in <Picture 1> (do not add windows or doors that are not in <Picture 1>), but paint the walls, floor and ceiling with the room's own materials and colors (its flooring and wallpaper), never plain gray.`,
   ];
   const furniture = visibleOrder(room);
   for (const f of furniture) {
