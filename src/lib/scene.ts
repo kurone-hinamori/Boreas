@@ -19,8 +19,11 @@ import {
 import { FURNITURE_KINDS, furnitureColor, type Place, ROOM_COLORS, seatAt, type Visible } from "./place";
 import { DEFAULT_CAMERA, isCreatureTarget, type StageCamera, type StageContact, type StagePerson, type StageProp } from "./stage";
 
-/** 清書に渡す画像の数の上限(Picture 1 の下絵を含む)。部屋・家具のデザインは、見えている割合の大きい物からこの数まで渡し、残りは文章で伝える */
-export const MAX_PICTURES = 8;
+/**
+ * 清書に渡す画像の数の上限(Picture 1 の下絵を含む)。部屋・家具のデザインは、見えている割合の大きい物からこの数まで渡し、残りは文章で伝える。
+ * M4 の検証で、6枚は1枚6〜15分で描けたが、8枚では1時間たっても終わらず ComfyUI が応答しなくなった(このPCのGPU)
+ */
+export const MAX_PICTURES = 6;
 
 /** 場面に置ける登場人物(人物と、人ではない登場人物を合わせて)の数(参照画像の数と、描き分けの安定性から) */
 export const MAX_CHARACTERS = PERSON_COLORS.length;
