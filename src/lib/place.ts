@@ -109,6 +109,8 @@ export interface Place {
   furniture: Furniture[];
   /** 部屋の説明(壁・床・窓の外・明かりなど) */
   description: Text;
+  /** 画風(部屋と家具のデザインのプロンプトの先頭に入れる)。空なら既定の画風(design.ts の DEFAULT_STYLE_EN) */
+  style: Text;
   /** 部屋のデザイン(人物のいない部屋の絵)。清書で背景の参照にする */
   design: Design | null;
 }
@@ -135,6 +137,7 @@ export function newPlace(title: string): Place {
     openings: [],
     furniture: [],
     description: { ja: "", en: "" },
+    style: { ja: "", en: "" },
     design: null,
   };
 }
@@ -147,6 +150,7 @@ export function normalizePlace(p: Place): Place {
     openings: p.openings ?? [],
     furniture: (p.furniture ?? []).map((f) => ({ ...f, name: f.name ?? { ja: "", en: "" }, design: f.design ?? null })),
     description: p.description ?? { ja: "", en: "" },
+    style: p.style ?? { ja: "", en: "" },
     design: p.design ?? null,
   };
 }
