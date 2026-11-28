@@ -3,6 +3,7 @@ import { BODY_PARTS, type BodyPart, Figure, type FigureId, type HandShape, LIMBS
 import { type PoseId, POSES } from "./poses";
 import { dirFromAngles, PROP_COLORS, PROP_KINDS, type PropShape, propMesh } from "./props";
 import { type BuiltCreature, buildCreature, type CreaturePart, type Exaggeration, NO_EXAGGERATION, type StageCreature } from "./creatures";
+import { buildRoom, furnitureMesh, type Place, seatAt, seatHeight, type Visible, visibleFurniture } from "./place";
 
 /** 場面の 3D 表示。下絵(清書に渡す画像)もここで撮る */
 
@@ -66,6 +67,8 @@ export interface StageState {
   creatures?: StageCreature[];
   props: StageProp[];
   contacts: StageContact[];
+  /** 場所(部屋・家具)。ないときは床の目安の円だけ */
+  place?: Place | null;
 }
 
 export interface StageCamera {
@@ -105,6 +108,12 @@ export class Stage {
   private creatures = new THREE.Group();
   private built: BuiltCreature[] = [];
   private handles = new THREE.Group();
+  /** 場所(部屋と家具)。場所が変わったときだけ作り直す */
+  private room = new THREE.Group();
+  private roomMesh: THREE.Group | null = null;
+  private furniture: THREE.Group[] = [];
+  private placeRef: Place | null | undefined = undefined;
+  private ground: THREE.Mesh;
   private loading = 0;
   private aspect = 1;
   private state: StageState = { people: [], props: [], contacts: [] };
@@ -122,7 +131,8 @@ export class Stage {
     // 床の目安(清書では描かない。立ち位置と大きさの手がかり)
     const ground = new THREE.Mesh(new THREE.CircleGeometry(3, 64), new THREE.MeshStandardMaterial({ color: 0xeeeeee }));
     ground.rotation.x = -Math.PI / 2;
-    this.scene.add(ground, this.extras, this.creatures, this.handles);
+    this.ground = ground;
+    this.scene.add(ground, this.room, this.extras, this.creatures, this.handles);
   }
 
   /** 表示する大きさ(px)と、枠の縦横比 */
@@ -135,6 +145,7 @@ export class Stage {
   async setState(state: StageState, selected: number | null) {
     this.state = state;
     this.selected = selected;
+    if (state.place !== this.placeRef) this.buildPlace(state.place ?? null);
     const key = state.people.map((p) => p.figure).join(",");
     if (key !== this.figureKey) {
       const ticket = ++this.loading;
@@ -146,6 +157,83 @@ export class Stage {
       loaded.forEach((f) => this.scene.add(f.root));
     }
     this.apply();
+  }
+
+  /** 部屋と家具を作り直す。場所があるときは、床の目安の円を出さない */
+  private buildPlace(place: Place | null) {
+    this.placeRef = place;
+    this.clear(this.room);
+    this.furniture = [];
+    this.roomMesh = null;
+    this.ground.visible = !place;
+    if (!place) return;
+    this.roomMesh = buildRoom(place);
+    this.furniture = place.furniture.map(furnitureMesh);
+    this.room.add(this.roomMesh, ...this.furniture);
+  }
+
+  /** いまのカメラから見える家具(設計書 5.5:場所があるときは、そのカメラから見える家具の一覧を出す) */
+  visibleFurniture(aspect = this.aspect): Visible[] {
+    if (!this.placeRef) return [];
+    const camera = this.camera.clone();
+    camera.aspect = aspect;
+    camera.updateProjectionMatrix();
+    const list = visibleFurniture(camera, this.roomMesh, this.furniture);
+    // 点では拾えない、画面の端に少しだけ写る家具も「一部」として足す(拾えないとプロンプトに書かれず、清書で別の物(ドアなど)に描かれた)
+    const pixels = this.furniturePixels(camera);
+    for (const [id, n] of pixels) if (n >= 3 && !list.some((v) => v.id === id)) list.push({ id, ratio: 0.01 });
+    return list;
+  }
+
+  /** 家具ごとに、画面に写る画素の数(小さく描いて数える。壁・人物などに隠れた所は数えない) */
+  private furniturePixels(camera: THREE.PerspectiveCamera): Map<string, number> {
+    const w = 240;
+    const h = Math.max(1, Math.round(w / camera.aspect));
+    const target = new THREE.WebGLRenderTarget(w, h);
+    const black = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    const ids = new Map<number, string>();
+    const swapped: [THREE.Mesh, THREE.Material | THREE.Material[]][] = [];
+    const ownMaterials: THREE.Material[] = [];
+    this.scene.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh) return;
+      let id: string | undefined;
+      for (let x: THREE.Object3D | null = o; x; x = x.parent) if (x.userData.furniture) id = x.userData.furniture as string;
+      let mat: THREE.Material = black;
+      if (id) {
+        const n = this.furniture.findIndex((f) => f.userData.furniture === id) + 1;
+        ids.set(n, id);
+        mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(n / 255, 0, 0), side: (m.material as THREE.Material).side });
+        ownMaterials.push(mat);
+      } else if (!Array.isArray(m.material)) {
+        // 片面だけの壁・天井は、片面のまま(外から見て写らない面は隠さない)
+        mat = new THREE.MeshBasicMaterial({ color: 0x000000, side: m.material.side });
+        ownMaterials.push(mat);
+      }
+      swapped.push([m, m.material]);
+      m.material = mat;
+    });
+    const clear = this.renderer.getClearColor(new THREE.Color());
+    const handles = this.handles.visible;
+    this.handles.visible = false;
+    this.renderer.setClearColor(0x000000);
+    this.renderer.setRenderTarget(target);
+    this.renderer.render(this.scene, camera);
+    const px = new Uint8Array(w * h * 4);
+    this.renderer.readRenderTargetPixels(target, 0, 0, w, h, px);
+    this.renderer.setRenderTarget(null);
+    this.renderer.setClearColor(clear);
+    this.handles.visible = handles;
+    for (const [m, mat] of swapped) m.material = mat;
+    ownMaterials.forEach((m) => m.dispose());
+    black.dispose();
+    target.dispose();
+    const out = new Map<string, number>();
+    for (let i = 0; i < px.length; i += 4) {
+      const id = ids.get(px[i]);
+      if (id && px[i + 1] === 0 && px[i + 2] === 0) out.set(id, (out.get(id) ?? 0) + 1);
+    }
+    return out;
   }
 
   /** ポーズ → 人ではない登場人物 → つかんだ手足 → 触れる点 → 視線 → 小物 の順に決める */
@@ -165,7 +253,11 @@ export class Stage {
       const f = this.figures[i];
       f.setColor(PERSON_COLORS[p.color % PERSON_COLORS.length].hex);
       f.setHeight(p.heightCm / 100);
-      f.root.position.set(p.x, 0, p.z);
+      // 座るポーズで、場所の椅子・ソファ・ベッドの上にいれば、その座面の高さに合わせる
+      const seatPose = POSES.find((d) => d.id === p.pose)?.seat;
+      const seat = seatPose ? seatAt(this.state.place, p.x, p.z) : null;
+      const kneeHeight = (p.heightCm / 100) * 0.25;
+      f.root.position.set(p.x, seat ? ((seat.elevationCm ?? 0) + seatHeight(seat)) / 100 - kneeHeight : 0, p.z);
       f.root.rotation.y = THREE.MathUtils.degToRad(p.rotation);
       f.pose(p.pose);
       // 小物を持つ手は、形を決めていなければ握る
@@ -174,13 +266,13 @@ export class Stage {
         const shape = p.hands?.[side] ?? "auto";
         f.handShape(side, shape === "auto" && holds(side) ? "fist" : shape);
       }
-      if (POSES.find((d) => d.id === p.pose)?.seat) {
+      if (seatPose && !seat) {
         // 座面の高さは、身長の 0.25 倍ほど(膝の高さ)
-        const h = (p.heightCm / 100) * 0.25;
-        const seat = new THREE.Mesh(new THREE.BoxGeometry(0.42, h, 0.42), new THREE.MeshStandardMaterial({ color: 0x9a7a5a }));
-        seat.position.set(0, h / 2, -0.02);
-        seat.applyMatrix4(f.root.matrix);
-        this.extras.add(seat);
+        const h = kneeHeight;
+        const box = new THREE.Mesh(new THREE.BoxGeometry(0.42, h, 0.42), new THREE.MeshStandardMaterial({ color: 0x9a7a5a }));
+        box.position.set(0, h / 2, -0.02);
+        box.applyMatrix4(f.root.matrix);
+        this.extras.add(box);
       }
     });
 
@@ -401,6 +493,7 @@ export class Stage {
     this.clear(this.extras);
     this.clear(this.handles);
     this.clear(this.creatures);
+    this.clear(this.room);
     this.renderer.dispose();
   }
 }

@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /><title>場所の確認</title>
+<style>body{margin:0;font:12px sans-serif}#grid{display:flex;flex-wrap:wrap;gap:6px}figure{margin:0;text-align:center}img{border:1px solid #ccc}pre{white-space:pre-wrap;font-size:11px;max-width:1100px}#plan{width:520px}#plan svg{width:100%}
+.plan-grid{stroke:#ececec}.plan-grid.major{stroke:#d8d8d8}.plan-wall{stroke:#222;stroke-width:6}.plan-swing{fill:none;stroke:#888;stroke-dasharray:4 3}.plan-furniture polygon{stroke:#333;stroke-width:1.5}.plan-furniture.warned polygon{stroke-dasharray:8 5;stroke:#000;stroke-width:3}.plan-front{stroke:#000;stroke-width:4}.plan-label{font-size:13px;text-anchor:middle;dominant-baseline:middle;paint-order:stroke;stroke:#fff;stroke-width:3px}.plan-mark circle{stroke:#fff;stroke-width:3}.plan-camera path{fill:rgba(0,0,0,.08);stroke:#555}</style></head>
+<body>
+<!--
+  開発用:場所(部屋・家具)の確かめ。確かめる部屋(鈴の部屋)と、同じ部屋の2つの場面(机に向かう・ベッドに腰かける)の下絵を並べる。
+  npm run dev で http://localhost:1430/dev/places.html を開く。
+  ?out=1 で、場面ごとの下絵(清書と同じ大きさ)・見える家具・プロンプト・渡す画像と、部屋・家具のデザインのプロンプトを window.out に出す。
+  window.__input = { characters }(Euros のキャラクター)を渡すと、それでプロンプトを作る
+-->
+<canvas id="c" width="640" height="480" style="display:none"></canvas>
+<div id="plan"></div>
+<div id="grid"></div>
+<pre id="log"></pre>
+<script type="module">
+import { createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { Stage, DEFAULT_CAMERA } from "/src/lib/stage.ts";
+import { checkPlace, newPlace, seatPose, FURNITURE_KINDS } from "/src/lib/place.ts";
+import { buildPrompt, newScene, referencesOf, sketchSize, FRAMES } from "/src/lib/scene.ts";
+import { roomDesignPrompt, furnitureDesignPrompt, DESIGN_SIZE } from "/src/lib/design.ts";
+import { refineWorkflow } from "/src/lib/comfy.ts";
+import { PlanView } from "/src/components/PlanView.tsx";
+
+const q = new URLSearchParams(location.search);
+const log = (t) => (document.getElementById("log").textContent += t + "\n");
+const grid = document.getElementById("grid");
+const show = (png, label, width) => {
+  const fig = document.createElement("figure");
+  fig.innerHTML = `<img src="${URL.createObjectURL(new Blob([png], { type: "image/png" }))}" style="width:${width}px"><figcaption>${label}</figcaption>`;
+  grid.append(fig);
+};
+const b64 = (bytes) => {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+};
+
+// 確かめる部屋:6畳ほど(360×270cm、天井 240cm)。奥の壁に窓と勉強机、左の壁にベッド、右の壁に本棚とドア、右奥にタンス
+const place = {
+  ...newPlace("鈴の部屋"),
+  id: "suzuroom",
+  description: {
+    ja: "古いアパートの6畳の部屋。白い壁紙、明るい木のフローリング、窓の外は住宅街の昼。",
+    en: "a small 6-tatami room in an old Japanese apartment, plain white wallpaper, light wooden flooring, daytime residential street outside the window",
+  },
+};
+const f = (id, kind, x, z, rotation, ja, en, patch = {}) => ({ id, kind, x, z, rotation, name: { ja, en }, ...FURNITURE_KINDS[kind].size, ...("seat" in FURNITURE_KINDS[kind] ? { seatCm: FURNITURE_KINDS[kind].seat } : {}), design: { file: `designs/${id}.png`, prompt: "", seed: 0, createdAt: "" }, ...patch });
+place.furniture = [
+  f("desk", "desk", 20, -105, 0, "木目の勉強机、上に古いモニター", "a wooden study desk with wood grain, an old computer monitor on it", { color: 0 }),
+  f("chair", "chair", 20, -70, 180, "黒いキャスター付きの事務椅子", "a black office chair on casters", { color: 1 }),
+  f("bed", "bed", -130, 35, 0, "白いシーツと水色の掛け布団のシングルベッド", "a single bed with white sheets and a light blue comforter", { color: 3, heightCm: 75 }),
+  f("shelf", "shelf", 165, -20, -90, "漫画と文庫本がぎっしり詰まった白い本棚", "a white bookshelf packed with manga and paperback books", { color: 5 }),
+  f("wardrobe", "wardrobe", 130, -107, 0, "薄茶色の木のタンス", "a light brown wooden chest of drawers", { color: 2, heightCm: 120 }),
+];
+place.openings = [
+  { id: "window", kind: "window", x: 20, z: -135, widthCm: 120, heightCm: 110, sillCm: 90 },
+  { id: "door", kind: "door", x: 180, z: 80, widthCm: 80, heightCm: 200, sillCm: 0 },
+];
+place.design = { file: "designs/room.png", prompt: "", seed: 0, createdAt: "" };
+
+const warnings = checkPlace(place);
+log(`寸法の点検:${warnings.length ? warnings.map((w) => w.text).join(" / ") : "問題なし"}`);
+// 点検が効くかの確かめ:わざと置き間違えた部屋
+const bad = { ...place, furniture: [...place.furniture.map((x) => (x.id === "shelf" ? { ...x, x: 170, z: 70 } : x)), f("tallchair", "chair", -150, -110, 0, "", "", { heightCm: 300 }), f("bed2", "bed", 0, 0, 30, "", "")] };
+log(`わざと置き間違えた部屋の点検:\n  ${checkPlace(bad).map((w) => w.text).join("\n  ")}`);
+
+const suzu = (patch) => ({ characterId: "suzu", revisionId: null, name: "天音 鈴", figure: "female_slim", heightCm: 150, x: 0, z: 0, rotation: 0, pose: "stand", headYaw: 0, headPitch: 0, color: 0, hands: { l: "auto", r: "auto" }, ik: {}, gaze: { kind: "manual" }, action: { ja: "", en: "" }, expression: { ja: "", en: "" }, ...patch });
+const byId = (id) => place.furniture.find((x) => x.id === id);
+
+// 同じ部屋の2つの場面:机に向かう(右手前から)・ベッドに腰かける(右から)
+const scenes = {
+  desk: (() => {
+    const s = newScene("机に向かう鈴");
+    s.frame = "portrait";
+    s.place = { id: place.id };
+    s.people = [suzu({ ...seatPose(byId("chair")), pose: "sit", headPitch: 15, action: { ja: "", en: "typing on the keyboard, looking at the monitor" }, expression: { ja: "", en: "tired, sleepy eyes" } })];
+    s.camera = { ...DEFAULT_CAMERA, yaw: 35, pitch: 12, distance: 2.3, targetY: 0.8, targetX: 0.15, targetZ: -0.85, fov: 50 };
+    s.background = { ja: "", en: "afternoon sunlight from the window" };
+    return s;
+  })(),
+  bed: (() => {
+    const s = newScene("ベッドに腰かける鈴");
+    s.frame = "landscape";
+    s.place = { id: place.id };
+    s.people = [suzu({ ...seatPose(byId("bed")), pose: "sit", action: { ja: "", en: "hands resting on her knees" }, expression: { ja: "", en: "absent-minded, looking down slightly" }, headPitch: 10 })];
+    s.camera = { ...DEFAULT_CAMERA, yaw: 70, pitch: 8, distance: 2.6, targetY: 0.75, targetX: -0.85, targetZ: 0.05, fov: 50 };
+    s.background = { ja: "", en: "afternoon sunlight from the window" };
+    return s;
+  })(),
+};
+
+const stage = new Stage(document.getElementById("c"));
+const input = window.__input ?? {};
+const characters = input.characters ?? { suzu: { id: "suzu", profile: { name: "天音 鈴" } } };
+const suzuId = Object.keys(characters)[0];
+const out = { place, warnings, designs: [], scenes: {} };
+
+// 部屋・家具のデザインのプロンプト
+const models = { unet: "UNET", clip: "CLIP", vae: "VAE" };
+const design = (file, prompt, [width, height]) => ({ file, prompt, workflow: refineWorkflow(models, { prompt, width, height, seed: 0, images: [] }) });
+out.designs.push(design(place.design.file, roomDesignPrompt(place), DESIGN_SIZE.room));
+for (const x of place.furniture) out.designs.push(design(x.design.file, furnitureDesignPrompt(x, place), DESIGN_SIZE.furniture));
+
+const planRoot = createRoot(document.getElementById("plan"));
+const plans = [];
+for (const [key, s] of Object.entries(scenes)) {
+  s.people.forEach((p) => (p.characterId = suzuId));
+  const [w, h] = q.get("out") ? sketchSize(s.frame) : [Math.round(sketchSize(s.frame)[0] / 2), Math.round(sketchSize(s.frame)[1] / 2)];
+  stage.resize(w, h);
+  stage.setCamera(s.camera);
+  await stage.setState({ ...s, place }, null);
+  stage.setCamera(s.camera);
+  const png = await stage.capture(w, h);
+  const visible = stage.visibleFurniture(w / h);
+  const room = { place, visible };
+  const refs = referencesOf(s, characters, {}, room);
+  const prompt = buildPrompt(s, characters, {}, room);
+  show(png, `${s.title}(見える家具:${visible.map((v) => byId(v.id).name.ja + (v.ratio < 0.5 ? "(一部)" : "")).join("・") || "なし"})`, q.get("out") ? w / 2 : w);
+  log(`\n■ ${s.title}\n見える家具:${JSON.stringify(visible)}\n渡す画像:${JSON.stringify(refs.list)}\n${prompt}`);
+  const { width, height } = FRAMES[s.frame];
+  const workflow = refineWorkflow(models, { prompt, width, height, seed: 0, images: ["IMAGE_0", ...refs.list.map((_, i) => `IMAGE_${i + 1}`)] });
+  out.scenes[key] = { title: s.title, sketch: b64(png), visible, refs: refs.list, prompt, workflow, scene: s };
+  // 間取り図の上の人物とカメラ
+  const yaw = s.camera.yaw;
+  const cp = { x: s.camera.targetX + s.camera.distance * Math.cos((s.camera.pitch * Math.PI) / 180) * Math.sin((yaw * Math.PI) / 180), z: s.camera.targetZ + s.camera.distance * Math.cos((s.camera.pitch * Math.PI) / 180) * Math.cos((yaw * Math.PI) / 180) };
+  plans.push(createElement("div", { key, style: { display: "inline-block", width: 260 } }, createElement(PlanView, { place, selected: null, warned: new Set(warnings.map((x) => x.target)), onSelect() {}, onMoveFurniture() {}, onMoveOpening() {}, marks: s.people.map((p) => ({ x: p.x, z: p.z, color: 0xe04848, label: key })), camera: { ...cp, yaw, fov: 60 } })));
+}
+planRoot.render(plans);
+window.out = out;
+window.done = true;
+</script>
+</body>
+</html>

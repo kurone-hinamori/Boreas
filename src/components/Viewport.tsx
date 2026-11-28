@@ -1,10 +1,13 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import type { LimbId } from "../lib/figures";
 import { Stage, type StageCamera, type StageState, type Vec3 } from "../lib/stage";
+import type { Visible } from "../lib/place";
 
 export interface ViewportHandle {
   /** 下絵を撮る(PNG) */
   capture: (width: number, height: number) => Promise<Uint8Array>;
+  /** いまのカメラから見える家具(aspect は撮る枠の縦横比) */
+  visibleFurniture: (aspect: number) => Visible[];
 }
 
 interface Props {
@@ -13,6 +16,10 @@ interface Props {
   camera: StageCamera;
   /** 枠の縦横比(幅 / 高さ) */
   aspect: number;
+  /** 表示の高さの上限(px)。なければ画面の高さに合わせる */
+  maxHeight?: number;
+  /** 場所があるとき、表示が変わるたびに、カメラから見える家具を知らせる */
+  onVisible?: (v: Visible[]) => void;
   onCamera: (c: StageCamera) => void;
   onSelect: (person: number | null) => void;
   onMovePerson: (person: number, x: number, z: number) => void;
@@ -43,6 +50,7 @@ export const Viewport = forwardRef<ViewportHandle, Props>(function Viewport(prop
       if (!stage.current) throw new Error("3D の表示がまだ準備できていません");
       return stage.current.capture(w, h);
     },
+    visibleFurniture: (aspect) => stage.current?.visibleFurniture(aspect) ?? [],
   }));
 
   useEffect(() => {
@@ -60,7 +68,7 @@ export const Viewport = forwardRef<ViewportHandle, Props>(function Viewport(prop
     const fit = () => {
       const parent = el.parentElement!;
       const maxW = parent.clientWidth;
-      const maxH = Math.max(320, window.innerHeight - 200);
+      const maxH = latest.current.maxHeight ?? Math.max(320, window.innerHeight - 200);
       const w = Math.min(maxW, maxH * aspect);
       const h = w / aspect;
       el.style.width = `${w}px`;
@@ -85,7 +93,11 @@ export const Viewport = forwardRef<ViewportHandle, Props>(function Viewport(prop
     const s = stage.current;
     if (!s) return;
     s.setCamera(camera);
-    void s.setState(state, selected).then(() => s.render());
+    void s.setState(state, selected).then(() => {
+      s.render();
+      const report = latest.current.onVisible;
+      if (report) report(s.visibleFurniture());
+    });
   }, [state, selected, camera]);
 
   const ndc = (e: { clientX: number; clientY: number }) => {

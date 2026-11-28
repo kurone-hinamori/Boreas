@@ -4,9 +4,9 @@ import type { Settings } from "../types";
 import { detectModels, progressText, refine, uploadImage } from "../lib/comfy";
 import { unloadModel, translateFields } from "../lib/ollama";
 import { useLeaveGuard } from "../lib/leaveGuard";
-import { buildPrompt, type EurosCharacter, FRAMES, newId, referencesOf, type Scene, sketchSize, type Take, type Text } from "../lib/scene";
+import { buildPrompt, type EurosCharacter, FRAMES, newId, type Reference, referencesOf, type Room, type Scene, sketchSize, type Take, type Text } from "../lib/scene";
 import type { EurosEquipment } from "../lib/props";
-import { deleteSceneFile, equipmentFileBytes, eurosFileBytes, exportSceneFile, saveSceneFile, sceneFileUrl } from "../lib/storage";
+import { deleteSceneFile, equipmentFileBytes, eurosFileBytes, exportSceneFile, placeFileBytes, saveSceneFile, sceneFileUrl } from "../lib/storage";
 import type { ViewportHandle } from "./Viewport";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -17,6 +17,8 @@ interface Props {
   scene: Scene;
   characters: Record<string, EurosCharacter>;
   equipment: Record<string, EurosEquipment>;
+  /** 場面の場所と、いまのカメラから見える家具(場所がなければ null) */
+  room: Room | null;
   settings: Settings;
   viewport: RefObject<ViewportHandle | null>;
   change: (fn: (s: Scene) => Scene, immediate?: boolean) => void;
@@ -44,8 +46,22 @@ function SceneImage({ sceneId, file, onClick }: { sceneId: string; file: string;
   return url ? <img src={url} alt="" onClick={onClick} /> : <div className="noimage">読み込み中…</div>;
 }
 
+/** Take に残す、渡した画像 */
+const sheetOf = (r: Reference | null): Take["sheets"][number] => {
+  switch (r!.kind) {
+    case "character":
+      return { characterId: r!.characterId, revisionId: r!.revisionId };
+    case "equipment":
+      return { equipmentId: r!.equipmentId, revisionId: r!.revisionId };
+    case "place":
+      return { placeId: r!.placeId, design: r!.image };
+    case "furniture":
+      return { placeId: r!.placeId, furnitureId: r!.furnitureId, design: r!.image };
+  }
+};
+
 /** 清書:下絵を撮り、シートと一緒に ComfyUI(MiniMax-H3-Image)に渡して候補を作る */
-export function RefinePanel({ scene, characters, equipment, settings, viewport, change, flush }: Props) {
+export function RefinePanel({ scene, characters, equipment, room, settings, viewport, change, flush }: Props) {
   const [count, setCount] = useState(2);
   const [status, setStatus] = useState<{ running: boolean; text: string; error?: string }>({ running: false, text: "" });
   const [translating, setTranslating] = useState(false);
@@ -55,11 +71,13 @@ export function RefinePanel({ scene, characters, equipment, settings, viewport, 
   useEffect(() => () => abort.current?.abort(), []);
 
   // Picture 2 以降に渡す画像(人物のシート → 人ではない登場人物のシート → 装備品のデザイン)
-  const refs = referencesOf(scene, characters, equipment);
+  const refs = referencesOf(scene, characters, equipment, room);
   const sheets = refs.list;
   const cast = [...scene.people, ...scene.creatures];
   const noSheet = cast.filter((_, i) => !sheets[i]).map((p) => p.name);
-  const prompt = buildPrompt(scene, characters, equipment);
+  const prompt = buildPrompt(scene, characters, equipment, room);
+  // 場所の説明が英語になっていなければ、場所の画面で英語にしてもらう
+  const placeNoEn = !!room && [room.place.description, ...room.place.furniture.map((f) => f.name)].some((t) => t.ja.trim() && !t.en.trim());
   // 日本語だけで、英語になっていない項目
   const texts: [string, Text][] = [
     ...scene.people.flatMap((p, i): [string, Text][] => [
@@ -108,13 +126,19 @@ export function RefinePanel({ scene, characters, equipment, settings, viewport, 
       const sketch = `sketches/${sketchId}.png`;
       await saveSceneFile(scene.id, sketch, sketchPng);
 
+      // 見える家具は、撮る枠の縦横比で数え直す(プロンプトと渡すデザインも、それに合わせる)
+      const shot: Room | null = room ? { place: room.place, visible: viewport.current.visibleFurniture(sw / sh) } : null;
+      const shotRefs = referencesOf(scene, characters, equipment, shot).list;
+      const shotPrompt = buildPrompt(scene, characters, equipment, shot);
+
       say("ComfyUI のモデルを確かめています");
       const models = await detectModels(settings);
       say("Ollama のモデルを GPU から外しています");
       await unloadModel(settings);
       say("下絵とシートを ComfyUI に送っています");
       const images = [await uploadImage(settings, `sketch_${scene.id}_${sketchId}.png`, sketchPng)];
-      for (const r of sheets) {
+      for (const r of shotRefs) {
+        if (r?.kind === "place" || r?.kind === "furniture") images.push(await uploadImage(settings, `place_${r.placeId}_${r.image.split("/").pop()}`, await placeFileBytes(r.placeId, r.image)));
         if (r?.kind === "character") images.push(await uploadImage(settings, `sheet_${r.characterId}_${r.revisionId}.${ext(r.image)}`, await eurosFileBytes(r.characterId, r.image)));
         if (r?.kind === "equipment") images.push(await uploadImage(settings, `equipment_${r.equipmentId}_${r.revisionId ?? "x"}.${ext(r.image)}`, await equipmentFileBytes(r.equipmentId, r.image)));
       }
@@ -130,12 +154,12 @@ export function RefinePanel({ scene, characters, equipment, settings, viewport, 
           sketch,
           result: null,
           seed,
-          prompt,
-          sheets: sheets.map((r) => (r!.kind === "character" ? { characterId: r!.characterId, revisionId: r!.revisionId } : { equipmentId: r!.equipmentId, revisionId: r!.revisionId })),
+          prompt: shotPrompt,
+          sheets: shotRefs.map(sheetOf),
         };
         const label = count > 1 ? `${i + 1}/${count}枚目:` : "";
         try {
-          const r = await refine(settings, models, { prompt, width, height, seed, images }, ctrl.signal, (p) => say(label + progressText(p)));
+          const r = await refine(settings, models, { prompt: shotPrompt, width, height, seed, images }, ctrl.signal, (p) => say(label + progressText(p)));
           const result = `results/${takeId}.png`;
           await saveSceneFile(scene.id, result, r.png);
           change((s) => ({ ...s, takes: [...s.takes, { ...base, result, workflow: r.workflow }], adopted: s.adopted ?? takeId }), true);
@@ -174,8 +198,8 @@ export function RefinePanel({ scene, characters, equipment, settings, viewport, 
       <div className="refine-grid">
         <div>
           <label className="field">
-            <span>背景(日本語)</span>
-            <textarea rows={2} value={scene.background.ja} placeholder="例:夕暮れの学校の屋上。金網のフェンス" onChange={(e) => change((s) => ({ ...s, background: { ...s.background, ja: e.target.value } }))} />
+            <span>{room ? "背景に足すこと(日本語。時間帯・窓の外など。部屋は場所の説明を使います)" : "背景(日本語)"}</span>
+            <textarea rows={2} value={scene.background.ja} placeholder={room ? "例:夜。窓の外は雨" : "例:夕暮れの学校の屋上。金網のフェンス"} onChange={(e) => change((s) => ({ ...s, background: { ...s.background, ja: e.target.value } }))} />
           </label>
           <div className="en-fields">
             <div className="row" style={{ marginBottom: 6 }}>
@@ -183,6 +207,7 @@ export function RefinePanel({ scene, characters, equipment, settings, viewport, 
                 {translating ? "英語にしています…" : "英語にする(Ollama)"}
               </button>
               {missingEn && <small className="error">英語になっていない項目があります</small>}
+              {placeNoEn && <small className="error">場所の説明が英語になっていません(場所の画面で英語にしてください)</small>}
             </div>
             {scene.people.map((p, i) => (
               <div key={i} className="two">

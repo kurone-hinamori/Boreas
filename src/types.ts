@@ -44,10 +44,3 @@ export interface CharacterSummary {
   /** 人ではない登場人物(Euros の sheet.notHuman) */
   notHuman: boolean;
 }
-
-/** 場面と場所は、中身を作るまで一覧に出す分だけ決めておく */
-export interface Entry {
-  id: string;
-  title?: string;
-  updatedAt?: string;
-}

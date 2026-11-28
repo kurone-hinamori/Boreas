@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { CharacterSummary, Entry, Folders, Settings } from "../types";
+import type { CharacterSummary, Folders, Settings } from "../types";
 import { DEFAULT_SETTINGS } from "../types";
 import type { EurosCharacter, Scene } from "./scene";
 import type { EurosEquipment } from "./props";
+import type { Place } from "./place";
 
 /** アプリのデータフォルダーの settings.json から読む */
 export async function loadSettings(): Promise<Settings> {
@@ -17,9 +18,6 @@ export const saveSettings = (settings: Settings) => invoke<void>("save_settings"
 
 export const folders = () => invoke<Folders>("folders");
 export const openFolder = (which: keyof Folders) => invoke<void>("open_folder", { which });
-
-export const listScenes = () => invoke<Entry[]>("list_scenes");
-export const listPlaces = () => invoke<Entry[]>("list_places");
 
 /** Euros のキャラクター(読むだけ) */
 export const listEurosCharacters = () => invoke<CharacterSummary[]>("list_euros_characters");
@@ -59,4 +57,21 @@ export const exportSceneFile = (id: string, file: string, path: string) => invok
 /** 場面の画像を <img> で見せる URL にする(使い終わったら URL.revokeObjectURL) */
 export async function sceneFileUrl(id: string, file: string): Promise<string> {
   return URL.createObjectURL(new Blob([(await sceneFileBytes(id, file)) as BlobPart], { type: "image/png" }));
+}
+
+// ---------------------------------------------------------------- 場所
+
+export const listPlaceData = () => invoke<Place[]>("list_places");
+export const loadPlace = (id: string) => invoke<Place>("load_place", { id });
+export const savePlace = (place: Place) => invoke<void>("save_place", { place });
+/** ライブラリの .trash に移す */
+export const deletePlace = (id: string) => invoke<void>("delete_place", { id });
+export const openPlaceFolder = (id: string) => invoke<void>("open_place_folder", { id });
+
+/** file は "designs/<id>.png"(部屋・家具のデザイン) */
+export const savePlaceFile = (id: string, file: string, bytes: Uint8Array) => invoke<void>("save_place_file", bytes, { headers: { id, file } });
+export const placeFileBytes = async (id: string, file: string) => new Uint8Array(await invoke<ArrayBuffer>("load_place_file", { id, file }));
+
+export async function placeFileUrl(id: string, file: string): Promise<string> {
+  return URL.createObjectURL(new Blob([(await placeFileBytes(id, file)) as BlobPart], { type: "image/png" }));
 }
