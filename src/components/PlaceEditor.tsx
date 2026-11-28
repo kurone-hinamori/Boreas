@@ -21,7 +21,7 @@ import {
   snapOpening,
   wallsOf,
 } from "../lib/place";
-import { DESIGN_SIZE, furnitureDesignPrompt, makeDesign, roomDesignPrompt } from "../lib/design";
+import { DEFAULT_STYLE_EN, DESIGN_SIZE, furnitureDesignPrompt, makeDesign, roomDesignPrompt } from "../lib/design";
 import { translateFields } from "../lib/ollama";
 import { useLeaveGuard } from "../lib/leaveGuard";
 import { DEFAULT_CAMERA, type StageCamera } from "../lib/stage";
@@ -183,11 +183,12 @@ export function PlaceEditor({ id, settings, onBack }: { id: string; settings: Se
     setTranslating(true);
     setDesignError(null);
     try {
-      const fields = Object.fromEntries([["room", place.description.ja], ...place.furniture.map((f) => [`f_${f.id}`, f.name.ja])]) as Record<string, string>;
+      const fields = Object.fromEntries([["room", place.description.ja], ["style", place.style.ja], ...place.furniture.map((f) => [`f_${f.id}`, f.name.ja])]) as Record<string, string>;
       const en = await translateFields(settings, fields);
       change((p) => ({
         ...p,
         description: { ...p.description, en: p.description.ja.trim() ? (en.room ?? p.description.en) : "" },
+        style: { ...p.style, en: p.style.ja.trim() ? (en.style ?? p.style.en) : "" },
         furniture: p.furniture.map((f) => ({ ...f, name: { ...f.name, en: f.name.ja.trim() ? (en[`f_${f.id}`] ?? f.name.en) : "" } })),
       }));
     } catch (e) {
@@ -210,6 +211,13 @@ export function PlaceEditor({ id, settings, onBack }: { id: string; settings: Se
       let p = place;
       const f = target === "room" ? null : p.furniture.find((x) => x.id === target);
       const text = target === "room" ? p.description : f?.name;
+      // 画風も、日本語だけなら英語にする(部屋と家具のどちらのデザインでも先頭に入る)
+      if (p.style.ja.trim() && !p.style.en.trim()) {
+        say("画風を英語にしています(Ollama)");
+        const style = { ...p.style, en: (await translateFields(settings, { t: p.style.ja })).t };
+        p = { ...p, style };
+        change((cur) => ({ ...cur, style }), true);
+      }
       if (text && text.ja.trim() && !text.en.trim()) {
         say("説明を英語にしています(Ollama)");
         const en = (await translateFields(settings, { t: text.ja })).t;
@@ -335,9 +343,17 @@ export function PlaceEditor({ id, settings, onBack }: { id: string; settings: Se
                   <span>部屋の説明(英語)</span>
                   <input className="en" value={place.description.en} onChange={(e) => change((p) => ({ ...p, description: { ...p.description, en: e.target.value } }))} />
                 </label>
+                <label className="field">
+                  <span>画風(日本語。部屋と家具のデザインの先頭に入ります)</span>
+                  <input value={place.style.ja} placeholder="空なら既定:手描きの2Dアニメ背景、セル調(写真・実写風にしない)" onChange={(e) => change((p) => ({ ...p, style: { ...p.style, ja: e.target.value } }))} />
+                </label>
+                <label className="field">
+                  <span>画風(英語)</span>
+                  <input className="en" value={place.style.en} placeholder={DEFAULT_STYLE_EN} onChange={(e) => change((p) => ({ ...p, style: { ...p.style, en: e.target.value } }))} />
+                </label>
                 <div className="row">
                   <button className="small" disabled={translating || !!designing} onClick={() => void translate()}>
-                    {translating ? "英語にしています…" : "部屋と家具の説明を英語にする(Ollama)"}
+                    {translating ? "英語にしています…" : "部屋・画風・家具の説明を英語にする(Ollama)"}
                   </button>
                   {designError?.target === "translate" && <small className="error">{designError.text}</small>}
                 </div>
