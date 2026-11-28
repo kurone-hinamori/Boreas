@@ -538,7 +538,9 @@ function roomLines(room: Room, refs: References): string[] {
     const what = clean(f.name.en) || `a ${FURNITURE_KINDS[f.kind].en}`;
     const picture = refs.furniture[f.id] ? `, the furniture shown in <Picture ${refs.furniture[f.id]}>` : "";
     const size = `about ${Math.round(f.widthCm)} cm wide, ${Math.round(f.depthCm)} cm deep, ${Math.round(f.heightCm)} cm tall`;
-    lines.push(`- The ${furnitureColor(f).en} box shape is the ${FURNITURE_KINDS[f.kind].en}: ${what}${picture} (${size}). Keep its size, direction and position exactly as in <Picture 1>.`);
+    // 一部だけ写る家具は、そう伝える(端に少し写る物を、別の物に描き変えないように)
+    const partly = (room.visible.find((v) => v.id === f.id)?.ratio ?? 1) < 0.5 ? ` Only part of it is in the frame; draw that part as the ${FURNITURE_KINDS[f.kind].en}.` : "";
+    lines.push(`- The ${furnitureColor(f).en} box shape is the ${FURNITURE_KINDS[f.kind].en}: ${what}${picture} (${size}). Keep its size, direction and position exactly as in <Picture 1>.${partly}`);
   }
   lines.push(furniture.length ? "Draw only the furniture shown in <Picture 1>; do not add other large furniture." : "No furniture of the room is visible from this camera; do not add large furniture.");
   return lines;

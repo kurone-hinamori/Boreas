@@ -178,7 +178,62 @@ export class Stage {
     const camera = this.camera.clone();
     camera.aspect = aspect;
     camera.updateProjectionMatrix();
-    return visibleFurniture(camera, this.roomMesh, this.furniture);
+    const list = visibleFurniture(camera, this.roomMesh, this.furniture);
+    // 点では拾えない、画面の端に少しだけ写る家具も「一部」として足す(拾えないとプロンプトに書かれず、清書で別の物(ドアなど)に描かれた)
+    const pixels = this.furniturePixels(camera);
+    for (const [id, n] of pixels) if (n >= 3 && !list.some((v) => v.id === id)) list.push({ id, ratio: 0.01 });
+    return list;
+  }
+
+  /** 家具ごとに、画面に写る画素の数(小さく描いて数える。壁・人物などに隠れた所は数えない) */
+  private furniturePixels(camera: THREE.PerspectiveCamera): Map<string, number> {
+    const w = 240;
+    const h = Math.max(1, Math.round(w / camera.aspect));
+    const target = new THREE.WebGLRenderTarget(w, h);
+    const black = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    const ids = new Map<number, string>();
+    const swapped: [THREE.Mesh, THREE.Material | THREE.Material[]][] = [];
+    const ownMaterials: THREE.Material[] = [];
+    this.scene.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh) return;
+      let id: string | undefined;
+      for (let x: THREE.Object3D | null = o; x; x = x.parent) if (x.userData.furniture) id = x.userData.furniture as string;
+      let mat: THREE.Material = black;
+      if (id) {
+        const n = this.furniture.findIndex((f) => f.userData.furniture === id) + 1;
+        ids.set(n, id);
+        mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(n / 255, 0, 0), side: (m.material as THREE.Material).side });
+        ownMaterials.push(mat);
+      } else if (!Array.isArray(m.material)) {
+        // 片面だけの壁・天井は、片面のまま(外から見て写らない面は隠さない)
+        mat = new THREE.MeshBasicMaterial({ color: 0x000000, side: m.material.side });
+        ownMaterials.push(mat);
+      }
+      swapped.push([m, m.material]);
+      m.material = mat;
+    });
+    const clear = this.renderer.getClearColor(new THREE.Color());
+    const handles = this.handles.visible;
+    this.handles.visible = false;
+    this.renderer.setClearColor(0x000000);
+    this.renderer.setRenderTarget(target);
+    this.renderer.render(this.scene, camera);
+    const px = new Uint8Array(w * h * 4);
+    this.renderer.readRenderTargetPixels(target, 0, 0, w, h, px);
+    this.renderer.setRenderTarget(null);
+    this.renderer.setClearColor(clear);
+    this.handles.visible = handles;
+    for (const [m, mat] of swapped) m.material = mat;
+    ownMaterials.forEach((m) => m.dispose());
+    black.dispose();
+    target.dispose();
+    const out = new Map<string, number>();
+    for (let i = 0; i < px.length; i += 4) {
+      const id = ids.get(px[i]);
+      if (id && px[i + 1] === 0 && px[i + 2] === 0) out.set(id, (out.get(id) ?? 0) + 1);
+    }
+    return out;
   }
 
   /** ポーズ → 人ではない登場人物 → つかんだ手足 → 触れる点 → 視線 → 小物 の順に決める */
