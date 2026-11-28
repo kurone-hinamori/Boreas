@@ -10,7 +10,7 @@ const clean = (s: string | undefined) => (s ?? "").trim().replace(/[\s.。]+$/, 
 
 /** 画風の欄が空のときの画風。文章だけで描くので、「anime」の一語では実写寄りになりやすい。はっきり手描きの2Dと書き、写真にしないと言う */
 export const DEFAULT_STYLE_EN =
-  "2D hand-drawn anime background art in the style of a Japanese light novel illustration, cel shading with clean line art and simple flat colors. Not a photograph, not photorealistic, not a 3D render";
+  "2D hand-drawn anime illustration in the style of a Japanese light novel, cel shading with clean line art and simple flat colors. Not a photograph, not photorealistic, not a 3D render";
 
 /** デザインのプロンプトの先頭に入れる画風の文。場所の「画風」(英語)があればそれ、無ければ既定の画風 */
 export function styleLine(place: Place): string {
@@ -41,12 +41,12 @@ export function roomDesignPrompt(place: Place): string {
 export function furnitureDesignPrompt(f: Furniture, place: Place): string {
   const kind = FURNITURE_KINDS[f.kind].en;
   const what = clean(f.name.en) || `a ${kind}`;
-  const room = clean(place.description.en);
   return [
     styleLine(place),
     `A design reference picture of a single piece of furniture for an anime-style light novel illustration: ${what} (a ${kind}, about ${Math.round(f.widthCm)} cm wide, ${Math.round(f.depthCm)} cm deep and ${Math.round(f.heightCm)} cm tall).`,
-    `Show the whole piece at a three-quarter front view on a plain white background, drawn in the art style above${room ? `, matching this room: ${room}` : ""}.`,
-    "Only this one piece of furniture. No people, no room, no text, no logo.",
+    // 部屋の説明(壁・床・ポスターなど)を入れると、画風の文と合わせて壁や床まで描かれた(2026-11-28)。家具の説明だけで描く
+    "Show the whole piece at a three-quarter front view, isolated on a plain white background, drawn in the art style above.",
+    "Only this one piece of furniture. No walls, no floor, no posters, no people, no text, no logo.",
   ].join("\n");
 }
 
